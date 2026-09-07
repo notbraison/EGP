@@ -1,0 +1,85 @@
+An end-to-end automated Python pipeline that scrapes public annual procurement plan data from the Kenya e-GP portal ([https://egpkenya.go.ke/public-app](https://egpkenya.go.ke/public-app)), updates a multi-sheet local master Excel file (Procuring_Entities.xlsx), generates individual formatted entity procurement plan workbooks (./entity_plans/), enriches contact and address details via targeted web searches, and synchronizes the live dataset to Google Workspace Sheets via Google Apps Script Web App endpoints.
+
+Sheet Schema & Workbook Architecture (Procuring_Entities.xlsx)
+latest_entities: Master scraped dataset containing 5 columns: Sr. No., Financial Year, Procuring Entity, APP Number, and the fully resolved APP URL.
+
+latest_entities_only: Streamlined dataset containing 2 columns: Sr. No. and Procuring Entity.
+
+Budget Totals: Formatted budget tracking sheet with an expanded 5-column schema:
+
+Column 1 (A): Sr. No.
+
+Column 2 (B): Procuring Entity
+
+Column 3 (C): Prequalification done (Manual entry field)
+
+Column 4 (D): Total Budget (Scraped/calculated sum)
+
+Column 5 (E): Status (Conditional formatting: green background #E2EFDA and text #375623 when set to "Done")
+
+addresses: Visits & Contact Tracker (9 columns) containing entity names, physical addresses, towns, counties, phones, assigned officers, and visit tracking.
+
+Dedicated Directory (./entity_plans/)
+Holds individual formatted Excel workbooks generated per approved procuring entity (e.g., ./entity_plans/20 PEST CONTROL PRODUCTS BOARD PP.xlsx).
+
+Contains merged banners, dynamic =SUM() formulas, standard headers, thin borders, and #,#0.00 currency cell formatting generated via openpyxl.
+
+Pipeline Architecture & Module Responsibilities
+1. Orchestrator (main.py)
+CLI menu loop supporting isolated module testing and end-to-end automation:
+
+[1] Full Pipeline: Sequential execution of Stage 1 Light Scrape, Stage 2 Deep Scrape, Budget Sync, Address Enrichment, and Google Sheets Sync.
+
+[2] Light Scrape (Step 1a): Entity indexing and URL resolution.
+
+[3] Deep Scrape (Step 1b): Individual entity plan generation and budget back-propagation.
+
+[4] Budget Tracker (Step 2): Re-indexing and schema alignment.
+
+[5] Address Tracker (Step 3): Contact enrichment via Bing searching.
+
+[6] GSuite Sync (Step 4): Live push to Google Workspace.
+
+2. Scraping Engine (scrape_entities.py)
+get_real_app_url(): Extracts parameters from onclick or href attributes (e.g., viewApp('28506', '1', 'HASH')) using Regex to resolve placeholder javascript:void(0) anchor tags into valid target links ([https://egpkenya.go.ke/public-view-app/](https://egpkenya.go.ke/public-view-app/){id}/{mode}/{hash}).
+
+Dual-Layer Blacklisting: Filters out county-level entities, county assemblies, and non-paying authorities during Stage 1 using an explicit BLACKLIST_ENTITIES set and string matching (e.g., "COUNTY", leading county codes like 4815 KAKAMEGA).
+
+Stage 1 (Light Scrape): Cycles through portal pagination, resolves APP URLs, applies blacklists, and writes clean records to latest_entities, latest_entities_only, and Budget Totals.
+
+Stage 2 (Deep Scrape): Skips entities marked "Done" or with Total Budget > 0 (should_skip_entity()). For active entities, navigates target URLs, parses procurement segment tables, constructs .xlsx files in ./entity_plans/, and updates Total Budget in Procuring_Entities.xlsx.
+
+Workbook Sync & Purge (sync_and_rename_workbooks()): Re-indexes ./entity_plans/ filenames when portal ordering shifts using normalized alphanumeric keys ("".join(c for c in name.upper() if c.isalnum())) and deletes orphan/blacklisted .xlsx files.
+
+3. Budget Alignment (budget_tracker.py)
+Indexes existing data across the 5-column schema in Budget Totals.
+
+Preserves manual inputs in Prequalification done, Total Budget, and Status while updating Sr. No. and Procuring Entity ordering to match latest_entities.
+
+Applies conditional fill and font styling to Column 5 (Status).
+
+4. Address Enrichment (address_tracker.py)
+Scans addresses for empty fields in physical address, town, county, phone, and email columns.
+
+Performs headless Bing searches with custom User-Agents and batch delays to bypass anti-bot systems.
+
+Extracts contacts via Regex, prefixes phone numbers with ' to preserve leading zeros in Excel, and automatically strips out blacklisted entity rows.
+
+5. Live Cloud Synchronization (sync_gsuite.py)
+Reads local Excel sheets and POSTs JSON payloads to Google Apps Script Web App endpoints using standard urllib.request.
+
+Pushes 5 columns for Budget Totals (BUDGET_SHEET_URL) and 9 columns for addresses (VISITS_SHEET_URL).
+
+6. Backend Integration (Google Apps Script)
+Receives POST payloads in doPost(e).
+
+Uses sheet.clearContents() to update data values without destroying formatting, title banners, header colors, or column widths.
+
+Core Technical Standards & Rules
+Excel File Locking: All target .xlsx files must be closed in Microsoft Excel before running Python write or rename operations to prevent PermissionError exceptions.
+
+JavaScript Navigation: Direct href attribute extractions yield javascript:void(0). Always parse onclick arguments using Regex to construct static public-view-app links.
+
+Dynamic AJAX Loading: Portal segment tables render via client-side JavaScript. Deep scrape tasks must wait for network idle states (wait_until="networkidle") and specific cell elements (table tbody tr td).
+
+Delta Operations: Maintain character normalization ("".join(c for c in string.upper() if c.isalnum())) across all scripts to reliably join datasets, preserve manual entries, and prevent duplicate files or duplicate sheet rows.

@@ -2,50 +2,55 @@ import json
 import urllib.request
 import openpyxl
 
-EXCEL_FILE = "Procuring_Entities_Workflow.xlsx"
-# Replace with the URL copied from Step 1
-WEB_APP_URL = "https://script.google.com/macros/s/AKfycbwYm_HzK17LPJ3TerMslhBaYWXke887YW5NMc3nc8K-razyviUQPwu-7rmXAZXNg_UG/exec"
+EXCEL_FILE = "Procuring_Entities.xlsx"
+
+# Web App URLs for both Google Sheets
+BUDGET_SHEET_URL = "https://script.google.com/macros/s/AKfycbwYm_HzK17LPJ3TerMslhBaYWXke887YW5NMc3nc8K-razyviUQPwu-7rmXAZXNg_UG/exec"
+VISITS_SHEET_URL = "https://script.google.com/macros/s/AKfycbzRjui20V9982w3Rdr8LiLJJJ3xOVACCfhZR-T50dCzAKbFGlKi810hostkA5tV91CceA/exec"
 
 
-def sync_sheet1_to_google_sheet():
+def sync_sheet_to_url(sheet_name, web_app_url, num_cols):
     wb = openpyxl.load_workbook(EXCEL_FILE, data_only=True)
-    if "Sheet1" not in wb.sheetnames:
-        raise ValueError("Sheet1 not found in local Excel file.")
+    if sheet_name not in wb.sheetnames:
+        print(f"[SKIP] Sheet '{sheet_name}' not found in Excel.")
+        return
 
-    s1 = wb["Sheet1"]
+    s = wb[sheet_name]
     data = []
 
-    # Read all non-empty rows from Sheet1
-    for row in s1.iter_rows(values_only=True):
-        # Stop reading if entire row is empty
+    for row in s.iter_rows(values_only=True):
         if any(cell is not None for cell in row):
-            # Convert None cells to empty strings for JSON compatibility
-            clean_row = [cell if cell is not None else "" for cell in row[:4]]
+            clean_row = [
+                cell if cell is not None else "" for cell in row[:num_cols]
+            ]
             data.append(clean_row)
 
     if not data:
-        print("No data found in Sheet1.")
+        print(f"No data found in '{sheet_name}'.")
         return
 
     payload = json.dumps({"data": data}).encode("utf-8")
     req = urllib.request.Request(
-        WEB_APP_URL,
+        web_app_url,
         data=payload,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
 
-    print("Sending Sheet1 data to Google Sheet...")
+    print(f"Syncing '{sheet_name}' to Google Sheets...")
     with urllib.request.urlopen(req) as response:
         result = json.loads(response.read().decode())
         if result.get("status") == "success":
-            print(
-                f"Successfully updated 'Budget Totals' tab with {len(data)}"
-                " rows!"
-            )
+            print(f"Successfully synced '{sheet_name}' ({len(data)} rows).")
         else:
-            print("Failed to update Google Sheet.")
+            print(f"Failed to sync '{sheet_name}'.")
+
+
+def sync_all_google_sheets():
+    # Syncs 5 full columns for 'Budget Totals'
+    sync_sheet_to_url("Budget Totals", BUDGET_SHEET_URL, num_cols=5)
+    sync_sheet_to_url("addresses", VISITS_SHEET_URL, num_cols=9)
 
 
 if __name__ == "__main__":
-    sync_sheet1_to_google_sheet()
+    sync_all_google_sheets()
