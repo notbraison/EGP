@@ -1,9 +1,11 @@
+## main.py
 import sys
 import time
 from address_tracker import update_address_tracker
 from budget_tracker import update_budget_totals
 from scrape_entities import (
     check_and_warn_locked_files,
+    reconcile_budget_totals_from_workbooks,
     run_deep_scrape,
     scrape_to_latest_entities,
 )
@@ -27,6 +29,24 @@ def ensure_no_file_locks() -> bool:
             print("[!] Operation canceled due to active Excel file locks.\n")
             return False
     return True
+
+def run_step_reconcile():
+    """Reconciles 'Budget Totals' by re-reading every entity workbook directly."""
+    if not ensure_no_file_locks():
+        return False
+
+    print("\n[RECONCILE] Recomputing Budget Totals from entity workbooks...")
+    start = time.time()
+    try:
+        reconcile_budget_totals_from_workbooks()
+        print(f"-> Completed reconcile in {round(time.time() - start, 2)}s\n")
+        return True
+    except PermissionError:
+        print("\n[ERROR] PermissionError: Please close 'Procuring_Entities.xlsx' in Excel and retry.\n")
+        return False
+    except Exception as e:
+        print(f"\n[ERROR] Reconcile failed: {e}\n")
+        return False
 
 
 def run_step_1a():
@@ -191,6 +211,7 @@ def print_menu():
     print(" [4] Step 2: Update 'Budget Totals'")
     print(" [5] Step 3: Update 'addresses' (Search & Fill)")
     print(" [6] Step 4: Sync to Google Workspace")
+    print(" [8] Reconcile 'Budget Totals' from entity workbooks (audit tool)")
     print(" ----------------------------------------")
     print(" [0] Exit")
     print("==========================================")
@@ -215,6 +236,8 @@ def main():
             run_step_4()
         elif choice == "7":
             run_pipeline_skip_step_3()
+        elif choice == "8":
+            run_step_reconcile()
         elif choice == "0":
             print("\nExiting workflow runner. Goodbye!")
             sys.exit(0)

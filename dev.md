@@ -1,69 +1,146 @@
-# DEV.md
+# Dev Notes
 
-# Initialize & Activate Virtual Environment
-python -m venv venv
-venv\Scripts\activate
+_Last updated: 2026-09-09_
 
-# Install Core Dependencies
-pip install openpyxl playwright pandas
-playwright install chromium
+## What this project does
 
-# Run Pipeline
-python main.py
+Automated pipeline that pulls Kenya e-GP public procurement plan data
+(https://egpkenya.go.ke/public-app), builds a local master workbook
+(`Procuring_Entities.xlsx`), generates one formatted workbook per procuring
+entity (`./entity_plans/`), and syncs the budget + address-tracking sheets to
+Google Sheets via Apps Script Web Apps.
 
-# Deactivate Environment
-deactivate
+## Architecture (current — API-based, post-rewrite)
 
+The original implementation scraped the portal's HTML table and tried to
+resolve `javascript:void(0)` anchor links via regex on `onclick` attributes.
+That approach never worked: this is a production Angular build, and click
+handlers are bound via `(click)="viewApp(item)"` templates, which compile
+to JS event listeners with **no `onclick` attribute in the DOM at all**.
+Confirmed via Playwright request/response logging.
 
-# File Architecture
+Investigation also found the site sits behind bot protection (plain
+`requests` gets `403` with no cookies set, even on a simple `GET` — the
+`XSRF-TOKEN` cookie is only issued to a real browser session). So the
+pipeline now uses a hybrid: **Playwright to mint a real, trusted browser
+session once, then plain fast JSON POSTs through that same session**
+(`context.request.post(...)`) for everything else. No more DOM table
+walking, no more clicking, no more `networkidle` waits (which never
+resolved anyway — see "Known site quirks" below).
 
-Procuring_Entities.xlsx: Local master workbook containing four sheets:
-  - Budget Totals: Main budget tracking sheet structured as: `Sr. No.` | `Procuring Entity` | `Prequalification done` | `Total Budget` | `Status`.
-  - latest_entities: Master scraped dataset containing Sr. No., Financial Year, Procuring Entity, APP Number, and target APP URL for deep scraping.
-  - latest_entities_only: Streamlined light-scrape dataset listing only Sr. No. and Procuring Entity.
-  - addresses: Master database for physical addresses, contact info, assigned officers, and visit tracking.
+### Key API endpoints (discovered via network interception)
 
-./entity_plans/: Dedicated directory holding individual formatted Excel workbooks per approved procuring entity (e.g., `./entity_plans/20 PEST CONTROL PRODUCTS BOARD PP.xlsx`).
+All require header `X-XSRF-TOKEN: <value from XSRF-TOKEN cookie>`, obtained
+by loading `https://egpkenya.go.ke/public-app` once in a real browser
+context.
 
-main.py: Pipeline orchestrator with CLI menu supporting Full Pipeline, Light Scrape (Step 1a), Deep Scrape (Step 1b), selective execution, timing, and error handling.
+| Endpoint                                     | Purpose                                                                                                                                              | Body                                                                                                                        |
+| -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `POST /api/app/public-app-detail`          | Entity/APP listing, paginated                                                                                                                        | `{appNumber:"", finYear:0, procuringEntity:null, pageSize, page}` (0-indexed page)                                        |
+| `POST /api/app/view-app-summary`           | Per-entity procurement segments, paginated                                                                                                           | `{page, searchTerm: json.dumps({appDetailsId, isSearch:false}), pageSize, appDetailsId, isSearch:false}` (1-indexed page) |
+| `POST /api/app/get-appdetail-summary/{id}` | Ministry name + APP metadata                                                                                                                         | none                                                                                                                        |
+| `POST /api/app/get-app-details/{id}`       | **AVOID** — leaks real user PII (login ID, email, phone, bcrypt hash of the officer who created the plan). Not used anywhere in the pipeline. |                                                                                                                             |
 
-scrape_entities.py: 
-  - Light Scrape & Filtering: Extracts e-GP Kenya portal records, immediately filters out blacklisted county/non-paying entities, and writes approved entities (~93 master targets) to `latest_entities`, `latest_entities_only`, and `Budget Totals`.
-  - Dynamic Workbook Sync: Matches existing entity files strictly by alphanumeric name keys and automatically re-indexes filename prefixes (`Sr. No.`) when portal order changes.
-  - Deep Scrape: Checks local budget statuses to skip pre-completed or manual entries, handles dynamic JavaScript click/navigation events on the e-GP portal, parses procurement segment tables, creates formatted individual `.xlsx` plan files, and updates `Budget Totals`.
+Every listing/segment response includes a `totalCount`/`totalcount` field,
+so pagination loops are exact (no trial-and-error probing).
 
-budget_tracker.py: Syncs `latest_entities` with `Budget Totals`, preserving manual entries in `Prequalification done`, `Total Budget`, and `Status` columns.
+### Known site quirks
 
-address_tracker.py: Syncs `latest_entities` with `addresses`, preserving manual contact and visit details while appending new entities.
+- A Deskpro live-chat widget (`support.egpkenya.go.ke/deskpro-messenger/...`)
+  keeps a persistent connection open, which means `wait_until="networkidle"`
+  **never resolves**. Always use `domcontentloaded` + an explicit
+  `wait_for_selector`, and block the widget's requests via
+  `page.route("**/deskpro-messenger/**", lambda route: route.abort())`.
+- The hash segment of `public-view-app/{id}/{mode}/{hash}` URLs is not
+  needed for anything — every useful endpoint is keyed by `appdetailid`
+  alone. The pipeline stores a hash-less reference URL in `latest_entities`
+  for human cross-checking only; it isn't clickable.
 
-sync_gsuite.py: Pushes local workbook datasets live to Google Sheets via Web App endpoints, preserving the expanded schema with `Prequalification done`.
+## File responsibilities
 
+- **`main.py`** — CLI menu / orchestrator. Steps 1a→1b→2→3→4, or full
+  pipeline, or skip-addresses variant.
+- **`scrape_entities.py`** — light scrape (`scrape_to_latest_entities`),
+  deep scrape (`run_deep_scrape`), entity workbook generation
+  (`create_entity_template`), blacklist filtering, and the new
+  `reconcile_budget_totals_from_workbooks` auditor (not yet wired into
+  `main.py`).
+- **`budget_tracker.py`** — re-indexes `Budget Totals` against
+  `latest_entities`, preserves computed Total Budget, and now also pulls
+  collaborator-edited Status/Prequal from the live Google Sheet before
+  recomputing (see "Google Sheets round trip" below).
+- Google sheets to this above - [docs.google.com/spreadsheets/d/18PZby5HOyY1EWue6rIZL6kHKv0h1mN-2oa3EV-aF9kw/edit?usp=sharing](https://docs.google.com/spreadsheets/d/18PZby5HOyY1EWue6rIZL6kHKv0h1mN-2oa3EV-aF9kw/edit?usp=sharing)
+- **`address_tracker.py`** — unchanged from the original design. Bing-based
+  contact enrichment via Playwright, independent of the eGP API rewrite.
+- Google sheets to this above - [docs.google.com/spreadsheets/d/1tCpLpMCHzEGwZzbk63q2j-KmXoG9SCUIoRPWl22MiIc/edit?usp=sharing](https://docs.google.com/spreadsheets/d/1tCpLpMCHzEGwZzbk63q2j-KmXoG9SCUIoRPWl22MiIc/edit?usp=sharing)
+- **`sync_gsuite.py`** — pushes `Budget Totals` (5 cols) and `addresses`
+  (9 cols) to their respective Google Apps Script Web App endpoints.
+- **`code.gs`** (Apps Script project `egp-scraper-updater`) — receives the
+  POST payload, clears + rewrites the sheet, reapplies formatting/status
+  highlighting. Also intended to serve `doGet` for the pull-down direction
+  (see bugs below).
 
-# Key Techniques Used
+## Data schema
 
-Headless Browser Scraping (Playwright): Bypasses WAF protections, CSRF token checks, and 403 payload rejections. Handles client-side JavaScript rendering and inline navigation (`href="javascript:void(0)"`) by waiting for `networkidle` state and loaded table cell elements (`table tbody tr td`).
+### `latest_entities` (6 columns — added APP Detail ID)
 
-Dual-Layer Blacklist Filtering: Automatically drops county-level entities, county assemblies, and non-paying authorities during Light Scrape using:
-  1. An explicit `BLACKLIST_ENTITIES` set containing 42 target entities.
-  2. Pattern matching rules that catch `"COUNTY"` keywords or leading county numeric codes (e.g., `4815 KAKAMEGA`).
+`Sr. No. | Financial Year | Procuring Entity | APP Number | APP URL | APP Detail ID`
 
-Smart Execution & Delta Scraping: `should_skip_entity()` checks `Budget Totals` before triggering browser runs. If an entity is marked `Status == "Done"` or has a calculated `Total Budget > 0`, deep scraping is skipped to save time and reduce server hits.
+`APP Detail ID` is the numeric `appdetailid` from the API — this is what
+lets deep scrape fetch segments directly, with no name-matching or
+re-navigating the listing page required.
 
-Index-Resilient File Renaming: Normalizes entity names using `"".join(c for c in name.upper() if c.isalnum())` to re-index local entity filenames in `./entity_plans/` when portal ordering shifts, preventing duplicate file creation and preserving sheet content.
+### `Budget Totals` (5 columns — reordered)
 
-Excel Template Engineering & Formula Injection: Programmatically constructs individual entity workbooks with merged top-level banners, standard headers, `#,#0.00` currency cell formatting, thin borders, auto-adjusted column widths, and live `=SUM()` dynamic formulas via `openpyxl`.
+`Sr. No. | Procuring Entity | Total Budget | Status | Prequalification done`
 
-Lightweight Web App Bridge: Uses standard Python `urllib.request` to POST JSON to a Google Apps Script `doPost(e)` endpoint, eliminating complex OAuth2 credentials and third-party login prompts.
+- **Total Budget**: formatted as `"KES" #,##0.00` everywhere it's written
+  (`scrape_to_latest_entities`, `update_master_budget_totals`,
+  `budget_tracker.py`, `reconcile_budget_totals_from_workbooks`).
+- **Status**: `Pending` (no formatting) → `Partial` (amber `FFF2CC` /
+  `9C6500`, bold) → `Done` (green `E2EFDA` / `375623`, bold). `Done` is
+  reserved for when OPEN/AGPO + Q1–Q4 exist — nothing in the current
+  pipeline sets it automatically. Deep scrape always writes `Partial`.
+- **Prequalification done**: intentionally left blank by the pipeline —
+  filled manually by your collaborator on the Google Sheet side, then
+  pulled back down locally by `pull_status_from_gsheet()`.
 
-Selective Canvas Clearing: Uses `sheet.clearContents()` in Google Apps Script to update dataset values without destroying title banners, column widths, or header fills.
+### Entity workbooks (`./entity_plans/{sr_no} {entity}.xlsx`)
 
+`Sr. No. | Segment | Total Cost | OPEN/AGPO | Q1 | Q2 | Q3 | Q4`
 
-# Crucial Considerations for Future Builds
+Only Sr No/Segment/Total Cost are populated by the current deep scrape.
+OPEN/AGPO and Q1–Q4 are written as blank strings (not `0.0`) so it's
+visually obvious in Excel that they're unpopulated rather than genuinely
+zero. This is intentional — second implementation territory (see below).
 
-Excel File Lock: `Procuring_Entities.xlsx` and any individual `.xlsx` files inside `./entity_plans/` must be closed in Microsoft Excel before running `main.py` or `scrape_entities.py`; otherwise, `openpyxl` or `os.rename()` will throw a `PermissionError`.
+### `addresses` (9 columns — unchanged)
 
-Blacklist Adjustments: If an entity needs to be restored or removed from scraping, update `BLACKLIST_ENTITIES` and `is_blacklisted()` inside `scrape_entities.py`.
+`Sr. No. | Procuring Entity | Physical Address | Town/Area | County | Phone | Email | ASSIGNED | VISIT`
 
-Dynamic AJAX Loading: The e-GP portal loads plan segments asynchronously via client-side JavaScript. Deep scrape logic must wait for network responses (`wait_until="networkidle"`) and cell elements (`table tbody tr td`) rather than generic table containers.
+## Google Sheets round trip (new)
 
-Apps Script Deployment Updates: Whenever modifying code in Google Apps Script, you must publish a New Version under Deploy → Manage deployments for changes to take effect on the Web App URL.
+Design: the Google Sheet is authoritative for **Status + Prequalification
+done only**. Your collaborator edits those two columns directly in
+Sheets. The local pipeline must never clobber that.
+
+Flow, in order:
+
+1. `budget_tracker.py` → `pull_status_from_gsheet()` — `GET`s the live
+   sheet, reads columns D/E (Status/Prequal) per entity, writes them into
+   the local workbook. Runs **before** any local recompute.
+2. Local recompute proceeds as normal (Total Budget from deep scrape /
+   reconcile, Status defaults for any entity the collaborator hasn't
+   touched yet).
+3. `sync_gsuite.py` pushes the full sheet back up, **after** step 1+2 — so
+   the collaborator's edits round-trip back to Sheets unchanged, alongside
+   the freshly computed totals.
+
+This depends on `code.gs` correctly serving `doGet` for step 1 to work at
+all — see bugs below.
+
+## Deferred to "second implementation"
+
+- Populating OPEN/AGPO and Q1–Q4 in entity workbooks — likely from the
+  portal's "Item Details" tab (seen in the UI, not yet reverse-engineered
+  via network capture the way APP Summary was).

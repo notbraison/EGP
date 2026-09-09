@@ -1,85 +1,100 @@
-An end-to-end automated Python pipeline that scrapes public annual procurement plan data from the Kenya e-GP portal ([https://egpkenya.go.ke/public-app](https://egpkenya.go.ke/public-app)), updates a multi-sheet local master Excel file (Procuring_Entities.xlsx), generates individual formatted entity procurement plan workbooks (./entity_plans/), enriches contact and address details via targeted web searches, and synchronizes the live dataset to Google Workspace Sheets via Google Apps Script Web App endpoints.
+An end-to-end automated Python pipeline that pulls public annual procurement plan data from the Kenya e-GP portal (https://egpkenya.go.ke/public-app) via its internal JSON API, updates a multi-sheet local master Excel file (Procuring_Entities.xlsx), generates individual formatted entity procurement plan workbooks (./entity_plans/), enriches contact and address details via targeted web searches, and synchronizes the live dataset to Google Workspace Sheets via Google Apps Script Web App endpoints — with Status/Prequalification edits round-tripping back from a human collaborator working directly in Google Sheets.
 
 Sheet Schema & Workbook Architecture (Procuring_Entities.xlsx)
-latest_entities: Master scraped dataset containing 5 columns: Sr. No., Financial Year, Procuring Entity, APP Number, and the fully resolved APP URL.
+
+latest_entities: Master scraped dataset containing 6 columns: Sr. No., Financial Year, Procuring Entity, APP Number, APP URL, and APP Detail ID (the numeric appdetailid returned by the portal's API — this is the key used for all deep-scrape calls; no other identifier is needed).
 
 latest_entities_only: Streamlined dataset containing 2 columns: Sr. No. and Procuring Entity.
 
-Budget Totals: Formatted budget tracking sheet with an expanded 5-column schema:
+Budget Totals: Budget tracking sheet with a 5-column schema, in this exact order:
 
 Column 1 (A): Sr. No.
 
 Column 2 (B): Procuring Entity
 
-Column 3 (C): Prequalification done (Manual entry field)
+Column 3 (C): Total Budget — formatted as "KES" #,##0.00 everywhere it is written.
 
-Column 4 (D): Total Budget (Scraped/calculated sum)
+Column 4 (D): Status — one of "Pending" (no fill), "Partial" (amber fill #FFF2CC, text #9C6500, bold — set automatically once deep scrape successfully pulls segment/cost data for an entity), or "Done" (green fill #E2EFDA, text #375623, bold — reserved for once OPEN/AGPO and Q1–Q4 data exists; nothing in the current pipeline sets this automatically).
 
-Column 5 (E): Status (Conditional formatting: green background #E2EFDA and text #375623 when set to "Done")
+Column 5 (E): Prequalification done — left blank by the pipeline. This is a manual field maintained by a human collaborator directly in the Google Sheet; the local pipeline pulls it (and Status) down before recomputing, and pushes both back up unchanged alongside the freshly computed Total Budget, so collaborator edits are never overwritten.
+
+blacklisted: 2-column visibility sheet (Sr. No., Procuring Entity) listing every entity excluded by the blacklist filter during Light Scrape — county-level entities, county assemblies, and the explicit BLACKLIST_ENTITIES set. Purpose: let collaborators see what's being excluded and why, without digging into code. Currently populated FROM the hardcoded blacklist (one-way); a planned follow-up will invert this so the blacklist itself is sourced FROM this sheet instead of being hardcoded.
 
 addresses: Visits & Contact Tracker (9 columns) containing entity names, physical addresses, towns, counties, phones, assigned officers, and visit tracking.
 
 Dedicated Directory (./entity_plans/)
-Holds individual formatted Excel workbooks generated per approved procuring entity (e.g., ./entity_plans/20 PEST CONTROL PRODUCTS BOARD PP.xlsx).
+Holds individual formatted Excel workbooks generated per approved procuring entity (e.g., ./entity_plans/20 PEST CONTROL PRODUCTS BOARD.xlsx).
 
-Contains merged banners, dynamic =SUM() formulas, standard headers, thin borders, and #,#0.00 currency cell formatting generated via openpyxl.
+8-column layout per workbook: Sr. No., Segment, Total Cost, OPEN/AGPO, Q1, Q2, Q3, Q4. Only Sr. No./Segment/Total Cost are currently populated (via the API's view-app-summary endpoint); OPEN/AGPO and Q1–Q4 are written as blank strings, not 0.0, so it's visually clear in Excel that they're genuinely unpopulated rather than zero. Populating these is deferred to a second implementation phase (likely sourced from the portal's "Item Details" tab, not yet reverse-engineered). Workbooks contain merged banners, a dynamic =SUM() formula on the Total Cost column, standard headers, thin borders, and "#,##0.00" cell formatting, generated via openpyxl.
 
 Pipeline Architecture & Module Responsibilities
+
 1. Orchestrator (main.py)
 CLI menu loop supporting isolated module testing and end-to-end automation:
 
-[1] Full Pipeline: Sequential execution of Stage 1 Light Scrape, Stage 2 Deep Scrape, Budget Sync, Address Enrichment, and Google Sheets Sync.
+[1] Full Pipeline: Sequential execution of Light Scrape, Deep Scrape, Budget Tracker, Address Enrichment, and Google Sheets Sync.
 
-[2] Light Scrape (Step 1a): Entity indexing and URL resolution.
+[2] Light Scrape (Step 1a): Full entity/APP listing pulled via direct API calls.
 
-[3] Deep Scrape (Step 1b): Individual entity plan generation and budget back-propagation.
+[3] Deep Scrape (Step 1b): Individual entity plan generation and budget back-propagation, via direct API calls keyed on APP Detail ID.
 
-[4] Budget Tracker (Step 2): Re-indexing and schema alignment.
+[4] Budget Tracker (Step 2): Pulls Status/Prequal from the live Google Sheet first, then re-indexes and schema-aligns the local Budget Totals sheet.
 
 [5] Address Tracker (Step 3): Contact enrichment via Bing searching.
 
-[6] GSuite Sync (Step 4): Live push to Google Workspace.
+[6] GSuite Sync (Step 4): Pushes Budget Totals, addresses, and blacklisted sheets to their Google Sheets endpoints.
 
-2. Scraping Engine (scrape_entities.py)
-get_real_app_url(): Extracts parameters from onclick or href attributes (e.g., viewApp('28506', '1', 'HASH')) using Regex to resolve placeholder javascript:void(0) anchor tags into valid target links ([https://egpkenya.go.ke/public-view-app/](https://egpkenya.go.ke/public-view-app/){id}/{mode}/{hash}).
+[7] Full Pipeline, skipping Step 3 (Addresses).
 
-Dual-Layer Blacklisting: Filters out county-level entities, county assemblies, and non-paying authorities during Stage 1 using an explicit BLACKLIST_ENTITIES set and string matching (e.g., "COUNTY", leading county codes like 4815 KAKAMEGA).
+[8] Reconcile Budget Totals from entity workbooks — standalone audit tool that recomputes each entity's Total Budget by re-reading its actual workbook file on disk, as a cross-check against what deep scrape wrote directly. Not part of the automated full-pipeline run; run on demand.
 
-Stage 1 (Light Scrape): Cycles through portal pagination, resolves APP URLs, applies blacklists, and writes clean records to latest_entities, latest_entities_only, and Budget Totals.
+2. Scraping Engine (scrape_entities.py) — API-based, not DOM scraping
+The portal (egpkenya.go.ke/public-app) is a production Angular build. Click handlers are bound via framework directives, not literal onclick attributes, so there is nothing in the DOM to regex against — this was the original (broken) approach and has been fully replaced. The site also sits behind bot protection: plain requests calls get 403 with no cookies set, even on a simple GET. The working approach is a hybrid:
 
-Stage 2 (Deep Scrape): Skips entities marked "Done" or with Total Budget > 0 (should_skip_entity()). For active entities, navigates target URLs, parses procurement segment tables, constructs .xlsx files in ./entity_plans/, and updates Total Budget in Procuring_Entities.xlsx.
+get_authenticated_context(): Launches a real Playwright/Chromium session once, loads the public-app page (blocking the Deskpro live-chat widget, which otherwise prevents wait_until="networkidle" from ever resolving — domcontentloaded + explicit wait_for_selector is used instead), and extracts the XSRF-TOKEN cookie the Angular app sets. This cookie plus an X-XSRF-TOKEN header is all that's needed to authenticate subsequent calls.
 
-Workbook Sync & Purge (sync_and_rename_workbooks()): Re-indexes ./entity_plans/ filenames when portal ordering shifts using normalized alphanumeric keys ("".join(c for c in name.upper() if c.isalnum())) and deletes orphan/blacklisted .xlsx files.
+api_post(): Fires JSON POSTs through that same authenticated Playwright browser context (context.request.post(...)) — real browser session, but no clicking, no DOM waits, no per-row navigation.
+
+fetch_all_entity_records(): Pulls the full entity/APP listing via POST /api/app/public-app-detail, paginating deterministically using the totalCount field embedded in every response (no trial-and-error page-size probing).
+
+fetch_entity_segments(): Pulls per-entity procurement segments via POST /api/app/view-app-summary, keyed by appDetailId, again paginating via the response's totalcount.
+
+Note: POST /api/app/get-app-details/{id} exists but is deliberately never called — it returns real user PII (login ID, email, phone, bcrypt password hash of the officer who created the plan) and has no legitimate use in this pipeline.
+
+Dual-Layer Blacklisting: is_blacklisted() filters out county-level entities, county assemblies, and non-paying authorities using an explicit BLACKLIST_ENTITIES set plus string-pattern matching (e.g., "COUNTY", leading county codes like "4815 KAKAMEGA"). Every entity this function excludes during Light Scrape is now also logged to the blacklisted sheet for visibility.
+
+Stage 1 (Light Scrape / scrape_to_latest_entities()): Pulls the full listing via the API, applies the blacklist (recording exclusions), and writes clean records to latest_entities, latest_entities_only, Budget Totals, and blacklisted, then saves.
+
+Stage 2 (Deep Scrape / run_deep_scrape()): Skips entities already marked "Partial"/"Done" or with Total Budget > 0 (should_skip_entity()). For active entities, fetches segments directly via API using the stored APP Detail ID — no navigation, no clicking — builds the workbook via create_entity_template(), and writes the computed total back with status "Partial".
+
+Workbook Sync & Purge (sync_and_rename_workbooks()): Re-indexes ./entity_plans/ filenames when portal ordering shifts using normalized alphanumeric keys ("".join(c for c in name.upper() if c.isalnum())), and deletes orphan/blacklisted .xlsx files.
+
+Reconciliation (reconcile_budget_totals_from_workbooks()): Re-derives each entity's total directly from its workbook file on disk (summing column C, skipping "TOTAL" label rows and formula-text cells), and only ever promotes Pending→Partial on a nonzero total — never touches an existing "Done" and never downgrades. A safety-net audit path independent of whatever update_master_budget_totals() wrote during deep scrape.
 
 3. Budget Alignment (budget_tracker.py)
-Indexes existing data across the 5-column schema in Budget Totals.
+pull_status_from_gsheet(): Runs first. Fetches the live Google Sheet (GET request to the Apps Script Web App) and pulls Status + Prequalification done (columns D/E) into the local file, without touching Total Budget. This must run before any local recompute so a human collaborator's edits in Google Sheets are never clobbered.
 
-Preserves manual inputs in Prequalification done, Total Budget, and Status while updating Sr. No. and Procuring Entity ordering to match latest_entities.
-
-Applies conditional fill and font styling to Column 5 (Status).
+update_budget_totals(): Re-indexes Budget Totals against latest_entities (data starts at row 2 — one header row only), preserving Total Budget/Status/Prequal already present, reformatting Total Budget as KES currency, and applying conditional fill/font styling to the Status column (green for "Done", amber for "Partial", plain otherwise).
 
 4. Address Enrichment (address_tracker.py)
-Scans addresses for empty fields in physical address, town, county, phone, and email columns.
-
-Performs headless Bing searches with custom User-Agents and batch delays to bypass anti-bot systems.
-
-Extracts contacts via Regex, prefixes phone numbers with ' to preserve leading zeros in Excel, and automatically strips out blacklisted entity rows.
+Unchanged from the original design — independent of the API rewrite above. Scans addresses for empty fields (physical address, town, county, phone, email), performs headless Bing searches with custom User-Agents and batch delays, extracts contacts via regex, prefixes phone numbers with ' to preserve leading zeros in Excel, and strips out blacklisted entity rows.
 
 5. Live Cloud Synchronization (sync_gsuite.py)
-Reads local Excel sheets and POSTs JSON payloads to Google Apps Script Web App endpoints using standard urllib.request.
+Reads local Excel sheets and POSTs JSON payloads (including a sheetName field so the Apps Script backend can route to the correct tab) to Google Apps Script Web App endpoints using standard urllib.request. Pushes 5 columns for Budget Totals and 2 columns for blacklisted (both via BUDGET_SHEET_URL, same spreadsheet, different tabs) and 9 columns for addresses (VISITS_SHEET_URL).
 
-Pushes 5 columns for Budget Totals (BUDGET_SHEET_URL) and 9 columns for addresses (VISITS_SHEET_URL).
+6. Backend Integration (Google Apps Script — code.gs, project "egp-scraper-updater")
+doPost(e): Reads sheetName from the payload (defaulting to "Budget Totals") and routes to the correct tab, creating it if absent. Uses sheet.clearContents() to update data values without destroying formatting, title banners, header colors, or column widths. Budget-Totals-specific formatting (border/alignment template copy + Done/Partial status highlighting) is applied only when sheetName === "Budget Totals"; other sheets (e.g. blacklisted) receive plain values only.
 
-6. Backend Integration (Google Apps Script)
-Receives POST payloads in doPost(e).
-
-Uses sheet.clearContents() to update data values without destroying formatting, title banners, header colors, or column widths.
+doGet(e): Top-level sibling function (not nested inside doPost — an earlier version had this bug, which silently broke pull_status_from_gsheet() since Apps Script requires both to be global). Accepts an optional ?sheet= query param (defaulting to "Budget Totals") and returns that sheet's full data range as JSON — this is what pull_status_from_gsheet() reads.
 
 Core Technical Standards & Rules
-Excel File Locking: All target .xlsx files must be closed in Microsoft Excel before running Python write or rename operations to prevent PermissionError exceptions.
 
-JavaScript Navigation: Direct href attribute extractions yield javascript:void(0). Always parse onclick arguments using Regex to construct static public-view-app links.
+Excel File Locking: All target .xlsx files must be closed in Microsoft Excel before running Python write or rename operations, to prevent PermissionError exceptions. check_and_warn_locked_files() detects and clears orphaned ~$*.xlsx lock files automatically, and warns/blocks on genuinely active locks.
 
-Dynamic AJAX Loading: Portal segment tables render via client-side JavaScript. Deep scrape tasks must wait for network idle states (wait_until="networkidle") and specific cell elements (table tbody tr td).
+No DOM Scraping / No Clicking: The portal's procurement listing and detail pages are Angular SPA views with no navigable onclick attributes and no full-page navigation on interaction visible to the DOM. All data retrieval goes through the site's internal JSON API (see Scraping Engine above), authenticated via a real Playwright browser session's XSRF cookie — never plain requests (blocked by bot protection) and never DOM table walking (fragile, and the underlying data isn't reliably present in the rendered HTML in the first place).
 
-Delta Operations: Maintain character normalization ("".join(c for c in string.upper() if c.isalnum())) across all scripts to reliably join datasets, preserve manual entries, and prevent duplicate files or duplicate sheet rows.
+Site Quirks: Never use wait_until="networkidle" against this site — a persistent Deskpro live-chat widget keeps a connection open indefinitely, so networkidle never resolves. Use domcontentloaded plus an explicit wait_for_selector, and block the widget's requests via page.route(...).
+
+Google Sheets as Partial Source of Truth: Status and Prequalification done in Budget Totals are authoritative on the Google Sheet side (edited by a human collaborator) — the local pipeline pulls them down before every recompute and pushes them back up unchanged afterward, alongside freshly computed Total Budget values. No other column follows this pattern.
+
+Delta Operations: Maintain character normalization ("".join(c for c in string.upper() if c.isalnum())) across all scripts (normalize_key()) to reliably join datasets, preserve manual entries, and prevent duplicate files or duplicate sheet rows.

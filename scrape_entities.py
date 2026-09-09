@@ -1,7 +1,7 @@
+## scrape_entities.py
 import os
 import re
-import sys
-import time
+import json
 import openpyxl
 import pandas as pd
 from openpyxl import Workbook, load_workbook
@@ -14,10 +14,12 @@ TARGET_SHEET = "latest_entities"
 SIMPLE_SHEET = "latest_entities_only"
 BUDGET_SHEET = "Budget Totals"
 PLANS_DIR = "./entity_plans"
+API_BASE = "https://egpkenya.go.ke/api/app"
+CURRENCY_FORMAT = '"KES" #,##0.00'
+BLACKLISTED_SHEET = "blacklisted"
 
 os.makedirs(PLANS_DIR, exist_ok=True)
 
-# Explicit list of 42 trimmed/county entities to drop automatically
 BLACKLIST_ENTITIES = {
     "OL KALOU TECHNICAL AND VOCATIONAL COLLEGE",
     "THIKA WATER AND SEWERAGE COMPANY LTD",
@@ -64,30 +66,25 @@ BLACKLIST_ENTITIES = {
 
 
 def is_blacklisted(entity_name: str) -> bool:
-    """Checks if entity matches explicit blacklist or county naming patterns."""
     clean_name = str(entity_name).strip()
     upper_name = clean_name.upper()
 
     if clean_name in BLACKLIST_ENTITIES or upper_name in BLACKLIST_ENTITIES:
         return True
-
     if "COUNTY" in upper_name:
         return True
-
     if clean_name and clean_name[0].isdigit() and ("-" in clean_name[:6] or " " in clean_name[:6]):
         return True
-
     return False
 
+
 def normalize_key(name: str) -> str:
-    """Normalizes strings for strict matching."""
     s = str(name).strip()
     s = re.sub(r"\b(PP|APP|PROCUREMENT PLAN)\b$", "", s, flags=re.IGNORECASE).strip()
     return "".join(c for c in s.upper() if c.isalnum())
 
 
 def check_and_warn_locked_files() -> bool:
-    """Checks for Excel lock files ('~$*.xlsx') and clears orphaned locks."""
     active_locks = []
     dirs_to_check = [".", PLANS_DIR] if os.path.exists(PLANS_DIR) else ["."]
 
@@ -115,7 +112,6 @@ def check_and_warn_locked_files() -> bool:
 
 
 def safe_save_workbook(wb: Workbook, filepath: str):
-    """Saves workbook with explicit PermissionError handling."""
     try:
         wb.save(filepath)
     except PermissionError:
@@ -125,23 +121,20 @@ def safe_save_workbook(wb: Workbook, filepath: str):
 
 
 def sync_and_rename_workbooks(master_df: pd.DataFrame):
-    """Renames existing entity workbooks and deletes blacklisted/orphan files."""
     existing_files = [
         f for f in os.listdir(PLANS_DIR)
         if f.endswith(".xlsx") and not f.startswith("~$")
     ]
-    
-    # Build set of valid normalized keys from master_df
+
     valid_keys = {normalize_key(row["Procuring Entity"]) for _, row in master_df.iterrows()}
-    
+
     file_map = {}
     for fname in existing_files:
         match = re.match(r"^(?:\d+\s+)?(.*)\.xlsx$", fname, re.IGNORECASE)
         if match:
             entity_part = match.group(1)
             norm_key = normalize_key(entity_part)
-            
-            # Delete file if entity is blacklisted/removed from latest_entities
+
             if norm_key not in valid_keys:
                 try:
                     os.remove(os.path.join(PLANS_DIR, fname))
@@ -151,7 +144,6 @@ def sync_and_rename_workbooks(master_df: pd.DataFrame):
             else:
                 file_map[norm_key] = fname
 
-    # Rename active files to match new Sr. No. indexes
     for _, row in master_df.iterrows():
         sr_no = int(row["Sr. No."])
         entity_name = str(row["Procuring Entity"]).strip()
@@ -169,136 +161,157 @@ def sync_and_rename_workbooks(master_df: pd.DataFrame):
                     print(f"[RENAME] {os.path.basename(old_filepath)} -> {os.path.basename(new_filepath)}")
                 except PermissionError:
                     print(f"[WARNING] Could not rename {os.path.basename(old_filepath)}: File locked.")
-                    
 
-def get_real_app_url(elem):
-    """Extracts viewApp parameters from onclick or href attributes on a link element,
 
-    handling both quoted ('28506') and unquoted (28506) argument formats.
+# ---------------------------------------------------------------------------
+# API-based session + fetch helpers (replaces DOM scraping / clicking)
+# ---------------------------------------------------------------------------
+
+def get_authenticated_context(playwright):
+    """Loads the portal once to establish a valid session + XSRF cookie."""
+    browser = playwright.chromium.launch(headless=True)
+    context = browser.new_context()
+    page = context.new_page()
+    page.route("**/deskpro-messenger/**", lambda route: route.abort())
+    page.goto("https://egpkenya.go.ke/public-app", wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_selector("table tbody tr", timeout=30000)
+
+    cookies = context.cookies()
+    xsrf = next((c["value"] for c in cookies if c["name"] == "XSRF-TOKEN"), None)
+    if not xsrf:
+        raise RuntimeError("Could not obtain XSRF-TOKEN — site may have changed its auth flow.")
+
+    page.close()
+    return browser, context, xsrf
+
+
+def api_post(context, xsrf, path, body=None):
+    headers = {"Content-Type": "application/json", "X-XSRF-TOKEN": xsrf}
+    resp = context.request.post(
+        f"{API_BASE}/{path}",
+        headers=headers,
+        data=json.dumps(body) if body is not None else None,
+    )
+    if resp.status != 200:
+        raise RuntimeError(f"API call failed [{resp.status}]: {path}")
+    return resp.json()
+
+
+def fetch_all_entity_records(context, xsrf, page_size=100):
+    """Pulls every listed entity/APP record via public-app-detail.
+    Loop is safe even if the server ignores page_size and caps it lower,
+    since 'page' always matches the number of successful iterations so far.
     """
-    if not elem:
-        return ""
+    all_records = []
+    page = 0
+    total = None
 
-    # Combine onclick and href to ensure we check both
-    onclick_attr = elem.get_attribute("onclick") or ""
-    href_attr = elem.get_attribute("href") or ""
-    combined_attr = f"{onclick_attr} {href_attr}"
+    while True:
+        body = {"appNumber": "", "finYear": 0, "procuringEntity": None, "pageSize": page_size, "page": page}
+        result = api_post(context, xsrf, "public-app-detail", body)
+        records = result.get("data", [])
+        if not records:
+            break
 
-    # Target viewApp(...) function call
-    match = re.search(r"viewApp\((.*?)\)", combined_attr)
-    if match:
-        raw_args = match.group(1)
-        # Strip quotes and spaces from arguments
-        args = [
-            arg.strip(" '\"") for arg in raw_args.split(",") if arg.strip()
-        ]
+        if total is None:
+            total = records[0].get("totalCount", len(records))
 
-        if len(args) >= 3:
-            app_id, mode, app_hash = args[0], args[1], args[2]
-            return f"https://egpkenya.go.ke/public-view-app/{app_id}/{mode}/{app_hash}"
+        all_records.extend(records)
+        page += 1
 
-    # Fallback: Direct relative/absolute path in href
-    if href_attr.startswith("/public-view-app"):
-        return f"https://egpkenya.go.ke{href_attr}"
-    elif href_attr.startswith("http"):
-        return href_attr
+        if len(all_records) >= total:
+            break
 
-    return ""
+    return all_records
 
+
+def fetch_entity_segments(context, xsrf, appdetailid, page_size=10):
+    """Pulls every procurement segment for an entity via view-app-summary."""
+    all_segments = []
+    page = 1
+    total = None
+
+    while True:
+        body = {
+            "page": page,
+            "searchTerm": json.dumps({"appDetailsId": appdetailid, "isSearch": False}),
+            "pageSize": page_size,
+            "appDetailsId": appdetailid,
+            "isSearch": False,
+        }
+        result = api_post(context, xsrf, "view-app-summary", body)
+        resp_data = result.get("respData", {})
+        rows = resp_data.get("reportdata", [])
+        if total is None:
+            total = resp_data.get("totalcount", len(rows))
+
+        for i, row in enumerate(rows, start=len(all_segments) + 1):
+            all_segments.append({
+                "sr_no": i,
+                "segment": row.get("description", ""),
+                "total_cost": row.get("totalCost", 0.0),
+            })
+
+        if not rows or len(all_segments) >= total:
+            break
+        page += 1
+
+    return all_segments
+
+
+# ---------------------------------------------------------------------------
+# Stage 1a: Light Scrape (API-based)
+# ---------------------------------------------------------------------------
 
 def scrape_to_latest_entities(file_path=EXCEL_FILE):
-    """Light Scrape: Extracts portal listing, converts void(0) JavaScript links into direct URLs, and filters out blacklisted entities."""
+    """Light Scrape: Pulls all entity/APP records via direct API calls, filters blacklist."""
     if not check_and_warn_locked_files():
         input("Press Enter after closing Excel to continue...")
 
-    scraped_data = []
-
+    print("Launching browser to establish authenticated session...")
     with sync_playwright() as p:
-        print("Launching browser for Light Scrape...")
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(viewport={"width": 1280, "height": 800})
-        page = context.new_page()
+        browser, context, xsrf = get_authenticated_context(p)
+        try:
+            print("Fetching full entity listing via API...")
+            records = fetch_all_entity_records(context, xsrf)
+            print(f"Retrieved {len(records)} raw records from API.")
+        finally:
+            browser.close()
 
-        page.route(
-            "**/*.{png,jpg,jpeg,svg,gif,woff,woff2,ttf}",
-            lambda route: route.abort(),
-        )
-
-        print("Navigating to e-GP Public APP page...")
-        page.goto(
-            "https://egpkenya.go.ke/public-app", wait_until="domcontentloaded"
-        )
-
-        current_page = 1
-
-        while True:
-            print(f"Scraping Page {current_page}...")
-            page.wait_for_selector("table tbody tr", timeout=10000)
-            time.sleep(0.5)
-
-            rows = page.query_selector_all("table tbody tr")
-            page_has_data = False
-
-            for row in rows:
-                cols = row.query_selector_all("td")
-                if len(cols) >= 4:
-                    fin_year = cols[1].inner_text().strip()
-                    entity = cols[2].inner_text().strip()
-
-                    # Apply early blacklist filter
-                    if is_blacklisted(entity):
-                        continue
-
-                    app_num_elem = cols[3].query_selector("a")
-                    if app_num_elem:
-                        app_num = app_num_elem.inner_text().strip()
-                        # Pass app_num_elem directly (NOT row)
-                        app_url = get_real_app_url(app_num_elem)
-                    else:
-                        app_num = cols[3].inner_text().strip()
-                        app_url = ""
-
-                    if entity:
-                        scraped_data.append((fin_year, entity, app_num, app_url))
-                        page_has_data = True
-
-            next_btn = page.query_selector(
-                "ul.pagination li:last-child a, .pagination button:last-child"
-            )
-
-            is_disabled = False
-            if next_btn:
-                parent_class = (
-                    next_btn.evaluate("el => el.parentElement.className") or ""
-                )
-                btn_class = next_btn.evaluate("el => el.className") or ""
-                if (
-                    "disabled" in parent_class.lower()
-                    or "disabled" in btn_class.lower()
-                ):
-                    is_disabled = True
-
-            if next_btn and not is_disabled and page_has_data:
-                current_page += 1
-                next_btn.click()
-                time.sleep(1.5)
-            else:
-                print("Reached final page.")
-                break
-
-        browser.close()
-
-    if not scraped_data:
+    if not records:
         print("No valid records scraped.")
         return
 
+    scraped_data = []
+    blacklisted_seen = []
+    for rec in records:
+        entity = str(rec.get("procuringentity", "")).strip()
+        if not entity:
+            continue
+        if is_blacklisted(entity):
+            blacklisted_seen.append(entity)
+            continue
+
+        fin_year = rec.get("financialyear", "")
+        app_num = rec.get("apprefno", "")
+        appdetailid = rec.get("appdetailid")
+        app_url = f"https://egpkenya.go.ke/public-view-app/{appdetailid}/1/"
+
+        scraped_data.append((fin_year, entity, app_num, app_url, appdetailid))
+
+    blacklisted_unique = list(dict.fromkeys(blacklisted_seen))
+
     seen = set()
     unique_records = []
-    for fin_year, entity, app_num, app_url in scraped_data:
-        key = (entity.upper(), app_num.upper())
+    for fin_year, entity, app_num, app_url, appdetailid in scraped_data:
+        key = (entity.upper(), str(app_num).upper())
         if key not in seen:
             seen.add(key)
-            unique_records.append((fin_year, entity, app_num, app_url))
+            unique_records.append((fin_year, entity, app_num, app_url, appdetailid))
+
+    if not unique_records:
+        print("No valid records scraped.")
+        return
 
     try:
         wb = (
@@ -307,91 +320,81 @@ def scrape_to_latest_entities(file_path=EXCEL_FILE):
             else openpyxl.Workbook()
         )
     except PermissionError:
-        print(
-            f"[PERMISSION ERROR] '{file_path}' is open in Excel. Close it and"
-            " try again."
-        )
+        print(f"[PERMISSION ERROR] '{file_path}' is open in Excel. Close it and try again.")
         return
 
-    # 1. Populate 'latest_entities'
+    # 1. Populate 'latest_entities' (6 columns, incl. APP Detail ID)
     if TARGET_SHEET in wb.sheetnames:
         del wb[TARGET_SHEET]
     s_full = wb.create_sheet(TARGET_SHEET)
     s_full.append(
-        ["Sr. No.", "Financial Year", "Procuring Entity", "APP Number", "APP URL"]
+        ["Sr. No.", "Financial Year", "Procuring Entity", "APP Number", "APP URL", "APP Detail ID"]
     )
-
-    for i, (fin_year, entity, app_num, app_url) in enumerate(
-        unique_records, start=1
-    ):
-        s_full.append([i, fin_year, entity, app_num, app_url])
+    for i, (fin_year, entity, app_num, app_url, appdetailid) in enumerate(unique_records, start=1):
+        s_full.append([i, fin_year, entity, app_num, app_url, appdetailid])
 
     # 2. Populate 'latest_entities_only'
     if SIMPLE_SHEET in wb.sheetnames:
         del wb[SIMPLE_SHEET]
     s_simple = wb.create_sheet(SIMPLE_SHEET)
     s_simple.append(["Sr. No.", "Procuring Entity"])
-
-    for i, (_, entity, _, _) in enumerate(unique_records, start=1):
+    for i, (_, entity, _, _, _) in enumerate(unique_records, start=1):
         s_simple.append([i, entity])
 
     # 3. Preserve/Initialize 'Budget Totals'
     if BUDGET_SHEET not in wb.sheetnames:
         s_budget = wb.create_sheet(BUDGET_SHEET)
         s_budget.append(
-            [
-                "Sr. No.",
-                "Procuring Entity",
-                "Prequalification done",
-                "Total Budget",
-                "Status",
-            ]
+            ["Sr. No.", "Procuring Entity", "Total Budget", "Status", "Prequalification done"]
         )
-        for i, (_, entity, _, _) in enumerate(unique_records, start=1):
-            s_budget.append([i, entity, "", 0.0, "Pending"])
+        for i, (_, entity, _, _, _) in enumerate(unique_records, start=1):
+            s_budget.append([i, entity, 0.0, "Pending", ""])
+            s_budget.cell(row=s_budget.max_row, column=3).number_format = CURRENCY_FORMAT
     else:
         s_budget = wb[BUDGET_SHEET]
         existing_data = {}
         for r in range(2, s_budget.max_row + 1):
             p_entity = s_budget.cell(row=r, column=2).value
             if p_entity:
-                prequal = s_budget.cell(row=r, column=3).value or ""
-                budget = s_budget.cell(row=r, column=4).value or 0.0
-                status = s_budget.cell(row=r, column=5).value or "Pending"
-                existing_data[normalize_key(p_entity)] = (
-                    prequal,
-                    budget,
-                    status,
-                )
+                budget = s_budget.cell(row=r, column=3).value or 0.0
+                status = s_budget.cell(row=r, column=4).value or "Pending"
+                prequal = s_budget.cell(row=r, column=5).value or ""
+                existing_data[normalize_key(p_entity)] = (budget, status, prequal)
 
-        # Re-write sheet with clean active entities
         wb.remove(s_budget)
         s_budget = wb.create_sheet(BUDGET_SHEET)
         s_budget.append(
-            [
-                "Sr. No.",
-                "Procuring Entity",
-                "Prequalification done",
-                "Total Budget",
-                "Status",
-            ]
+            ["Sr. No.", "Procuring Entity", "Total Budget", "Status", "Prequalification done"]
         )
-
-        for i, (_, entity, _, _) in enumerate(unique_records, start=1):
+        for i, (_, entity, _, _, _) in enumerate(unique_records, start=1):
             key = normalize_key(entity)
-            prequal, budget, status = existing_data.get(
-                key, ("", 0.0, "Pending")
-            )
-            s_budget.append([i, entity, prequal, budget, status])
+            budget, status, prequal = existing_data.get(key, (0.0, "Pending", ""))
+            s_budget.append([i, entity, budget, status, prequal])
+            s_budget.cell(row=s_budget.max_row, column=3).number_format = CURRENCY_FORMAT
 
+    # 4. Populate 'blacklisted' sheet
+    if BLACKLISTED_SHEET in wb.sheetnames:
+        del wb[BLACKLISTED_SHEET]
+    s_blacklist = wb.create_sheet(BLACKLISTED_SHEET)
+    s_blacklist.append(["Sr. No.", "Procuring Entity"])
+    for i, entity in enumerate(blacklisted_unique, start=1):
+        s_blacklist.append([i, entity])
+
+    # 5. Save
     safe_save_workbook(wb, file_path)
-    print(
-        f"Success! Written {len(unique_records)} clean records with resolved"
-        f" URLs to '{EXCEL_FILE}'."
-    )
-    
+    print(f"Success! Written {len(unique_records)} clean records to '{EXCEL_FILE}'.")
+    print(f"Logged {len(blacklisted_unique)} blacklisted entities to '{BLACKLISTED_SHEET}'.")
+
+# ---------------------------------------------------------------------------
+# Entity workbook generation (as you edited — unchanged)
+# ---------------------------------------------------------------------------
+
 def create_entity_template(sr_no: int, entity_name: str, app_no: str, scraped_segments: list) -> float:
-    """Generates formatted entity Excel workbook and returns total budget."""
+    """Generates formatted entity Excel workbook and returns total budget.
+
+    scraped_segments items only need: sr_no, segment, total_cost.
+    OPEN/AGPO and Q1-Q4 columns are left blank pending a future deep-scrape stage.
+    """
     filepath = os.path.join(PLANS_DIR, f"{sr_no} {entity_name}.xlsx")
     wb = Workbook()
     ws = wb.active
@@ -434,16 +437,14 @@ def create_entity_template(sr_no: int, entity_name: str, app_no: str, scraped_se
             item.get("sr_no", current_row - start_row + 1),
             item.get("segment", ""),
             item.get("total_cost", 0.0),
-            item.get("open_agpo", ""),
-            item.get("q1", 0.0),
-            item.get("q2", 0.0),
-            item.get("q3", 0.0),
-            item.get("q4", 0.0),
+            "",
+            "",
+            "",
+            "",
+            "",
         ])
 
         ws.cell(row=current_row, column=3).number_format = "#,##0.00"
-        for col in range(5, 9):
-            ws.cell(row=current_row, column=col).number_format = "#,##0.00"
         for col in range(1, 9):
             ws.cell(row=current_row, column=col).border = thin_border
         current_row += 1
@@ -452,12 +453,6 @@ def create_entity_template(sr_no: int, entity_name: str, app_no: str, scraped_se
     ws.cell(row=total_row, column=1, value="TOTAL").font = font_bold
     ws.cell(row=total_row, column=3, value=f"=SUM(C{start_row}:C{total_row-1})").font = font_bold
     ws.cell(row=total_row, column=3).number_format = "#,##0.00"
-
-    for col in range(5, 9):
-        col_letter = get_column_letter(col)
-        c = ws.cell(row=total_row, column=col, value=f"=SUM({col_letter}{start_row}:{col_letter}{total_row-1})")
-        c.font = font_bold
-        c.number_format = "#,##0.00"
 
     for col in range(1, 9):
         ws.cell(row=total_row, column=col).border = Border(
@@ -473,8 +468,10 @@ def create_entity_template(sr_no: int, entity_name: str, app_no: str, scraped_se
     return sum(item.get("total_cost", 0.0) for item in scraped_segments)
 
 
-def update_master_budget_totals(entity_name: str, calculated_total: float, status: str = "Done"):
-    """Updates entity budget total and status in 'Budget Totals' sheet."""
+def update_master_budget_totals(entity_name: str, calculated_total: float, status: str = "Partial"):
+    """Updates entity budget total and status in 'Budget Totals' sheet.
+    Column order: Sr. No. | Procuring Entity | Total Budget | Status | Prequalification done
+    """
     try:
         wb = load_workbook(EXCEL_FILE)
     except PermissionError:
@@ -487,15 +484,147 @@ def update_master_budget_totals(entity_name: str, calculated_total: float, statu
     for r in range(2, ws.max_row + 1):
         cell_val = str(ws.cell(row=r, column=2).value or "")
         if normalize_key(cell_val) == norm_target:
-            ws.cell(row=r, column=4, value=calculated_total).number_format = "#,##0.00"
-            ws.cell(row=r, column=5, value=status)
+            budget_cell = ws.cell(row=r, column=3, value=calculated_total)
+            budget_cell.number_format = CURRENCY_FORMAT
+            ws.cell(row=r, column=4, value=status)
             break
 
     safe_save_workbook(wb, EXCEL_FILE)
+    
+def reconcile_budget_totals_from_workbooks(plans_dir=PLANS_DIR, file_path=EXCEL_FILE):
+    """
+    Walks every entity workbook in `plans_dir` and sums all genuine segment
+    rows in column C (Total Cost). Rows are excluded from the sum only if:
+      (a) column A or B literally reads "TOTAL" (legacy summary rows), or
+      (b) column C holds a formula rather than a literal number — since
+          data_only=False returns formula cells as their formula TEXT
+          (e.g. "=SUM(C2:C56)"), which fails float conversion and is
+          naturally skipped without needing special-case detection.
+    This means unlabeled trailing SUM-formula rows (no "TOTAL" text) are
+    already safe and won't be double-counted.
+
+    Status is intentionally NOT auto-promoted to "Done" here: many
+    legitimate segments have blank OPEN/AGPO..Q4 cells because those
+    fields don't apply to them, not because the row is unfinished — and
+    there's no reliable way to tell the two apart from cell contents
+    alone. This only ever moves Pending -> Partial when a nonzero total
+    is found, and never touches an existing "Done" or downgrades anything.
+    Mark "Done" manually once you're satisfied an entity is complete.
+    """
+    if not os.path.exists(plans_dir):
+        print(f"[ERROR] '{plans_dir}' does not exist.")
+        return
+
+    workbook_files = [f for f in os.listdir(plans_dir) if f.endswith(".xlsx") and not f.startswith("~$")]
+    if not workbook_files:
+        print("No entity workbooks found to reconcile.")
+        return
+
+    try:
+        master_wb = load_workbook(file_path)
+    except PermissionError:
+        print(f"[PERMISSION ERROR] '{file_path}' is open in Excel. Close it and re-run.")
+        return
+
+    if BUDGET_SHEET not in master_wb.sheetnames:
+        print(f"[ERROR] '{BUDGET_SHEET}' sheet not found in {file_path}.")
+        return
+
+    budget_ws = master_wb[BUDGET_SHEET]
+
+    row_lookup = {}
+    for r in range(2, budget_ws.max_row + 1):
+        entity_val = budget_ws.cell(row=r, column=2).value
+        if entity_val:
+            row_lookup[normalize_key(entity_val)] = r
+
+    updated, skipped, unmatched = 0, 0, []
+
+    def to_number(val):
+        if isinstance(val, (int, float)):
+            return float(val)
+        if isinstance(val, str):
+            try:
+                return float(val.replace(",", "").replace("KES", "").strip())
+            except ValueError:
+                return None  # covers formula text like "=SUM(...)" too
+        return None
+
+    def is_total_label(val) -> bool:
+        return str(val or "").strip().upper() == "TOTAL"
+
+    for fname in workbook_files:
+        filepath = os.path.join(plans_dir, fname)
+        match = re.match(r"^(?:\d+\s+)?(.*)\.xlsx$", fname, re.IGNORECASE)
+        entity_from_filename = match.group(1) if match else fname.replace(".xlsx", "")
+        norm_key = normalize_key(entity_from_filename)
+
+        try:
+            wb = load_workbook(filepath, data_only=False)
+        except Exception as e:
+            print(f"[ERROR] Could not open {fname}: {e}")
+            continue
+
+        ws = wb.active
+
+        total = 0.0
+        row_count = 0
+        for r in range(3, ws.max_row + 1):
+            col_a = ws.cell(row=r, column=1).value
+            col_b = ws.cell(row=r, column=2).value
+            if is_total_label(col_a) or is_total_label(col_b):
+                continue
+
+            num = to_number(ws.cell(row=r, column=3).value)
+            if num is not None:
+                total += num
+                row_count += 1
+
+        if row_count == 0:
+            unmatched.append(f"{fname} (no numeric values found in column C)")
+            continue
+
+        target_row = row_lookup.get(norm_key)
+        if target_row is None:
+            unmatched.append(fname)
+            continue
+
+        current_status = str(budget_ws.cell(row=target_row, column=4).value or "").strip().lower()
+        if current_status == "done":
+            new_status = "Done"
+        elif total > 0:
+            new_status = "Partial"
+        else:
+            new_status = "Pending"
+
+        current_val = budget_ws.cell(row=target_row, column=3).value or 0.0
+        values_match = isinstance(current_val, (int, float)) and abs(current_val - total) < 0.01
+        status_match = current_status == new_status.lower()
+
+        if values_match and status_match:
+            skipped += 1
+            continue
+
+        budget_cell = budget_ws.cell(row=target_row, column=3, value=total)
+        budget_cell.number_format = CURRENCY_FORMAT
+        budget_ws.cell(row=target_row, column=4, value=new_status)
+
+        updated += 1
+        print(f"[RECONCILE] {entity_from_filename}: KES {total:,.2f} ({row_count} segments -> {new_status})")
+
+    safe_save_workbook(master_wb, file_path)
+
+    print(f"\nDone. Updated: {updated}, already correct: {skipped}, unmatched: {len(unmatched)}")
+    if unmatched:
+        print("Unmatched:")
+        for f in unmatched:
+            print(f"  - {f}")
+
+if __name__ == "__main__":
+    reconcile_budget_totals_from_workbooks()
 
 
 def should_skip_entity(entity_name: str, budget_df: pd.DataFrame) -> bool:
-    """Checks if entity already has a calculated budget or is marked 'Done'."""
     if budget_df is None or budget_df.empty:
         return False
 
@@ -514,8 +643,12 @@ def should_skip_entity(entity_name: str, budget_df: pd.DataFrame) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Stage 1b: Deep Scrape (API-based)
+# ---------------------------------------------------------------------------
+
 def run_deep_scrape(file_path=EXCEL_FILE, overwrite=False):
-    """Deep Scrape with smart skip filters and resilient DOM rendering waits."""
+    """Deep Scrape via direct API calls keyed on APP Detail ID — no clicking, no DOM waits."""
     if not check_and_warn_locked_files():
         input("Press Enter after closing Excel to continue...")
 
@@ -529,76 +662,45 @@ def run_deep_scrape(file_path=EXCEL_FILE, overwrite=False):
         print(f"[PERMISSION ERROR] Cannot read '{file_path}'. Please close Microsoft Excel.")
         return
 
+    if "APP Detail ID" not in df.columns:
+        print("[ERROR] 'latest_entities' has no 'APP Detail ID' column. Re-run Step 1a (Light Scrape) first.")
+        return
+
     sync_and_rename_workbooks(df)
 
+    print("Launching browser to establish authenticated session...")
     with sync_playwright() as p:
-        print("Launching browser for Deep Scrape...")
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
-        page = context.new_page()
+        browser, context, xsrf = get_authenticated_context(p)
 
-        for _, row in df.iterrows():
-            sr_no = int(row["Sr. No."])
-            entity = str(row["Procuring Entity"]).strip()
-            app_no = str(row["APP Number"]).strip() if pd.notna(row.get("APP Number")) else ""
-            app_url = str(row.get("APP URL", "")).strip()
+        try:
+            for _, row in df.iterrows():
+                sr_no = int(row["Sr. No."])
+                entity = str(row["Procuring Entity"]).strip()
+                app_no = str(row["APP Number"]).strip() if pd.notna(row.get("APP Number")) else ""
+                appdetailid = row.get("APP Detail ID")
 
-            target_filepath = os.path.join(PLANS_DIR, f"{sr_no} {entity}.xlsx")
+                if pd.isna(appdetailid):
+                    print(f"[WARNING] Missing APP Detail ID for [{sr_no}] {entity}. Skipping.")
+                    continue
+                appdetailid = int(appdetailid)
 
-            # 1. Skip check based on local Excel budget status
-            if not overwrite and should_skip_entity(entity, budget_df):
-                print(f"[SKIP] Entity completed/has budget: [{sr_no}] {entity}")
-                continue
+                target_filepath = os.path.join(PLANS_DIR, f"{sr_no} {entity}.xlsx")
 
-            if os.path.exists(target_filepath) and not overwrite:
-                print(f"[SKIP] Workbook exists: {target_filepath}")
-                continue
-
-            print(f"Deep Scraping [{sr_no}] {entity}...")
-            try:
-                # Navigate to Portal APP directory page
-                page.goto("https://egpkenya.go.ke/public-app", wait_until="domcontentloaded")
-                
-                # Locate specific entity row
-                link_locator = page.locator(
-                    f"xpath=//tr[contains(., '{entity}') or contains(., '{app_no}')]//a"
-                ).first
-
-                if link_locator.count() == 0:
-                    print(f"[WARNING] Could not locate link for [{sr_no}] {entity}")
+                if not overwrite and should_skip_entity(entity, budget_df):
+                    print(f"[SKIP] Entity completed/has budget: [{sr_no}] {entity}")
                     continue
 
-                # Click link safely & wait for network response
-                with page.expect_navigation(wait_until="networkidle", timeout=12000):
-                    link_locator.click()
+                if os.path.exists(target_filepath) and not overwrite:
+                    print(f"[SKIP] Workbook exists: {target_filepath}")
+                    continue
 
-                # Resilient DOM check for loaded table cells
-                page.wait_for_selector("table tbody tr td", timeout=10000)
-
-                segments = []
-                s_rows = page.query_selector_all("table tbody tr")
-                for s_row in s_rows:
-                    cols = s_row.query_selector_all("td")
-                    if len(cols) >= 3:
-                        def parse_num(val_str):
-                            clean = re.sub(r"[^\d.]", "", val_str)
-                            return float(clean) if clean else 0.0
-
-                        segments.append({
-                            "sr_no": cols[0].inner_text().strip(),
-                            "segment": cols[1].inner_text().strip(),
-                            "total_cost": parse_num(cols[2].inner_text()),
-                            "open_agpo": cols[3].inner_text().strip() if len(cols) > 3 else "",
-                            "q1": parse_num(cols[4].inner_text()) if len(cols) > 4 else 0.0,
-                            "q2": parse_num(cols[5].inner_text()) if len(cols) > 5 else 0.0,
-                            "q3": parse_num(cols[6].inner_text()) if len(cols) > 6 else 0.0,
-                            "q4": parse_num(cols[7].inner_text()) if len(cols) > 7 else 0.0,
-                        })
-
-                tot = create_entity_template(sr_no, entity, app_no, segments)
-                update_master_budget_totals(entity, tot, status="Done")
-
-            except Exception as e:
-                print(f"[ERROR] Failed deep scrape for {entity}: {e}")
-
-        browser.close()
+                print(f"Deep Scraping [{sr_no}] {entity} (id={appdetailid})...")
+                try:
+                    segments = fetch_entity_segments(context, xsrf, appdetailid)
+                    tot = create_entity_template(sr_no, entity, app_no, segments)
+                    update_master_budget_totals(entity, tot, status="Partial")
+                    print(f"  -> {len(segments)} segments, total KES {tot:,.2f}")
+                except Exception as e:
+                    print(f"[ERROR] Failed deep scrape for {entity}: {e}")
+        finally:
+            browser.close()

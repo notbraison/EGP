@@ -1,3 +1,4 @@
+## sync_gsuite.py
 import json
 import urllib.request
 import openpyxl
@@ -9,7 +10,7 @@ BUDGET_SHEET_URL = "https://script.google.com/macros/s/AKfycbwYm_HzK17LPJ3TerMsl
 VISITS_SHEET_URL = "https://script.google.com/macros/s/AKfycbzRjui20V9982w3Rdr8LiLJJJ3xOVACCfhZR-T50dCzAKbFGlKi810hostkA5tV91CceA/exec"
 
 
-def sync_sheet_to_url(sheet_name, web_app_url, num_cols):
+def sync_sheet_to_url(sheet_name, web_app_url, num_cols, remote_sheet_name=None):
     wb = openpyxl.load_workbook(EXCEL_FILE, data_only=True)
     if sheet_name not in wb.sheetnames:
         print(f"[SKIP] Sheet '{sheet_name}' not found in Excel.")
@@ -29,7 +30,10 @@ def sync_sheet_to_url(sheet_name, web_app_url, num_cols):
         print(f"No data found in '{sheet_name}'.")
         return
 
-    payload = json.dumps({"data": data}).encode("utf-8")
+    payload = json.dumps({
+        "data": data,
+        "sheetName": remote_sheet_name or sheet_name,
+    }).encode("utf-8")
     req = urllib.request.Request(
         web_app_url,
         data=payload,
@@ -47,9 +51,9 @@ def sync_sheet_to_url(sheet_name, web_app_url, num_cols):
 
 
 def sync_all_google_sheets():
-    # Syncs 5 full columns for 'Budget Totals'
     sync_sheet_to_url("Budget Totals", BUDGET_SHEET_URL, num_cols=5)
     sync_sheet_to_url("addresses", VISITS_SHEET_URL, num_cols=9)
+    sync_sheet_to_url("blacklisted", BUDGET_SHEET_URL, num_cols=2, remote_sheet_name="blacklisted")
 
 
 if __name__ == "__main__":
