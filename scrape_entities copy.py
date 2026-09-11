@@ -2,7 +2,6 @@
 import os
 import re
 import json
-import time
 import openpyxl
 import pandas as pd
 from openpyxl import Workbook, load_workbook
@@ -18,11 +17,8 @@ PLANS_DIR = "./entity_plans"
 API_BASE = "https://egpkenya.go.ke/api/app"
 CURRENCY_FORMAT = '"KES" #,##0.00'
 BLACKLISTED_SHEET = "blacklisted"
-ITEM_DOWNLOAD_DIR = "./temp_downloads"
-TAG_ORDER = ["OPEN", "RFQ", "RFQ WOMEN", "RFQ YOUTH", "RFQ PWD"]
 
 os.makedirs(PLANS_DIR, exist_ok=True)
-os.makedirs(ITEM_DOWNLOAD_DIR, exist_ok=True)
 
 BLACKLIST_ENTITIES = {
     "OL KALOU TECHNICAL AND VOCATIONAL COLLEGE",
@@ -230,13 +226,7 @@ def fetch_all_entity_records(context, xsrf, page_size=100):
 
 
 def fetch_entity_segments(context, xsrf, appdetailid, page_size=10):
-    """Pulls every procurement segment for an entity via view-app-summary.
-
-    Captures 'segment_code' (the raw 'unspscsegment' field, e.g.
-    "44000000") alongside segment/total_cost — this is the join key used
-    by categorize_and_aggregate_items() to map Item Details rows back to
-    the correct segment.
-    """
+    """Pulls every procurement segment for an entity via view-app-summary."""
     all_segments = []
     page = 1
     total = None
@@ -260,7 +250,6 @@ def fetch_entity_segments(context, xsrf, appdetailid, page_size=10):
                 "sr_no": i,
                 "segment": row.get("description", ""),
                 "total_cost": row.get("totalCost", 0.0),
-                "segment_code": str(row.get("unspscsegment", "")).strip(),
             })
 
         if not rows or len(all_segments) >= total:
@@ -397,22 +386,15 @@ def scrape_to_latest_entities(file_path=EXCEL_FILE):
     print(f"Logged {len(blacklisted_unique)} blacklisted entities to '{BLACKLISTED_SHEET}'.")
 
 # ---------------------------------------------------------------------------
-# Entity workbook generation
+# Entity workbook generation (as you edited — unchanged)
 # ---------------------------------------------------------------------------
 
-def create_entity_template(sr_no: int, entity_name: str, app_no: str,
-                            scraped_segments: list, item_data: dict = None) -> float:
+def create_entity_template(sr_no: int, entity_name: str, app_no: str, scraped_segments: list) -> float:
     """Generates formatted entity Excel workbook and returns total budget.
 
-    item_data: optional {segment_code: {"open_agpo": "...", "q1": "...",
-    "q2": "...", "q3": "...", "q4": "..."}}, as produced by
-    categorize_and_aggregate_items(). When a segment's code isn't found in
-    item_data (feature not run yet, or that entity's enrichment failed),
-    falls back to blank strings — same as the original behavior before
-    this feature existed.
+    scraped_segments items only need: sr_no, segment, total_cost.
+    OPEN/AGPO and Q1-Q4 columns are left blank pending a future deep-scrape stage.
     """
-    item_data = item_data or {}
-
     filepath = os.path.join(PLANS_DIR, f"{sr_no} {entity_name}.xlsx")
     wb = Workbook()
     ws = wb.active
@@ -451,17 +433,15 @@ def create_entity_template(sr_no: int, entity_name: str, app_no: str,
     current_row = start_row
 
     for item in scraped_segments:
-        seg_result = item_data.get(item.get("segment_code", ""), {})
-
         ws.append([
             item.get("sr_no", current_row - start_row + 1),
             item.get("segment", ""),
             item.get("total_cost", 0.0),
-            seg_result.get("open_agpo", ""),
-            seg_result.get("q1", ""),
-            seg_result.get("q2", ""),
-            seg_result.get("q3", ""),
-            seg_result.get("q4", ""),
+            "",
+            "",
+            "",
+            "",
+            "",
         ])
 
         ws.cell(row=current_row, column=3).number_format = "#,##0.00"
@@ -510,8 +490,7 @@ def update_master_budget_totals(entity_name: str, calculated_total: float, statu
             break
 
     safe_save_workbook(wb, EXCEL_FILE)
-
-
+    
 def reconcile_budget_totals_from_workbooks(plans_dir=PLANS_DIR, file_path=EXCEL_FILE):
     """
     Walks every entity workbook in `plans_dir` and sums all genuine segment
@@ -641,6 +620,9 @@ def reconcile_budget_totals_from_workbooks(plans_dir=PLANS_DIR, file_path=EXCEL_
         for f in unmatched:
             print(f"  - {f}")
 
+if __name__ == "__main__":
+    reconcile_budget_totals_from_workbooks()
+
 
 def should_skip_entity(entity_name: str, budget_df: pd.DataFrame) -> bool:
     if budget_df is None or budget_df.empty:
@@ -722,294 +704,3 @@ def run_deep_scrape(file_path=EXCEL_FILE, overwrite=False):
                     print(f"[ERROR] Failed deep scrape for {entity}: {e}")
         finally:
             browser.close()
-
-
-# ---------------------------------------------------------------------------
-# Item Details / OPEN-AGPO feature
-# ---------------------------------------------------------------------------
-
-def derive_segment_code(item_code: str) -> str:
-    """UNSPSC item codes are hierarchical: first 2 digits are the segment.
-    E.g. '10101510' -> '10000000'. Not a heuristic — this is what the
-    first 2 digits of a UNSPSC code mean by definition.
-    """
-    digits = re.sub(r"\D", "", str(item_code))
-    return digits[:2] + "000000" if len(digits) >= 2 else ""
-
-
-def _to_float(val) -> float:
-    try:
-        return float(str(val).replace(",", "").strip())
-    except (ValueError, TypeError):
-        return 0.0
-
-
-def tag_for_item(item: dict):
-    """Returns the tag for a qualifying item, or None if it doesn't qualify
-    (not Request for Quotation / Open Tender)."""
-    method = item["procurement_method"]
-
-    if method == "Open Tender":
-        return "OPEN"
-
-    if method == "Request for Quotation":
-        if item["reservation_group"].upper() == "AGPO":
-            if item["women"] > 0:
-                return "RFQ WOMEN"
-            if item["youth"] > 0:
-                return "RFQ YOUTH"
-            if item["pwd"] > 0:
-                return "RFQ PWD"
-            return "RFQ"
-        return "RFQ"
-
-    return None
-
-
-def categorize_and_aggregate_items(items: list) -> dict:
-    """One segment's items -> {"open_agpo": "...", "q1": "...", "q2": "...", "q3": "...", "q4": "..."}"""
-    quarter_tags = {"q1": set(), "q2": set(), "q3": set(), "q4": set()}
-    all_tags = set()
-
-    for item in items:
-        tag = tag_for_item(item)
-        if tag is None:
-            continue
-        all_tags.add(tag)
-        for q in ("q1", "q2", "q3", "q4"):
-            if item[q] > 0:
-                quarter_tags[q].add(tag)
-
-    def ordered_join(tag_set):
-        ordered = [t for t in TAG_ORDER if t in tag_set]
-        return ", ".join(ordered) if ordered else "0"
-
-    return {
-        "open_agpo": ordered_join(all_tags),
-        "q1": ordered_join(quarter_tags["q1"]),
-        "q2": ordered_join(quarter_tags["q2"]),
-        "q3": ordered_join(quarter_tags["q3"]),
-        "q4": ordered_join(quarter_tags["q4"]),
-    }
-
-
-def parse_item_details_export(filepath: str) -> list:
-    """Reads a downloaded Item Details export into a list of raw item dicts."""
-    wb = openpyxl.load_workbook(filepath, data_only=True)
-    ws = wb.active
-
-    header = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
-    col_idx = {name: i for i, name in enumerate(header)}
-
-    def get(row_vals, name, default=""):
-        idx = col_idx.get(name)
-        return row_vals[idx] if idx is not None and idx < len(row_vals) else default
-
-    items = []
-    for r in range(2, ws.max_row + 1):
-        row_vals = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1)]
-        if not any(v not in (None, "") for v in row_vals):
-            continue
-
-        item_code = get(row_vals, "UNSPSC/Item Code")
-        items.append({
-            "segment_code": derive_segment_code(item_code),
-            "procurement_method": str(get(row_vals, "Procurement Method", "")).strip(),
-            "reservation_group": str(get(row_vals, "Preference & Reservation Group", "")).strip(),
-            "women": _to_float(get(row_vals, "Women", 0)),
-            "youth": _to_float(get(row_vals, "Youth", 0)),
-            "pwd": _to_float(get(row_vals, "PWD", 0)),
-            "q1": _to_float(get(row_vals, "Q1", 0)),
-            "q2": _to_float(get(row_vals, "Q2", 0)),
-            "q3": _to_float(get(row_vals, "Q3", 0)),
-            "q4": _to_float(get(row_vals, "Q4", 0)),
-        })
-
-    return items
-
-
-def search_and_open_entity(page, app_number: str, entity_name: str) -> str:
-    """Navigates the listing, searches by APP Number, clicks the matching
-    row, and lands on the entity's real hashed public-view-app URL."""
-    page.goto("https://egpkenya.go.ke/public-app", wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_selector("table tbody tr", timeout=30000)
-
-    toggle = page.locator("#first-toggle")
-    if toggle.count() == 0:
-        raise RuntimeError("Search accordion toggle (#first-toggle) not found.")
-
-    if toggle.get_attribute("aria-expanded") != "true":
-        toggle.click()
-        page.wait_for_function(
-            "document.querySelector('#first-toggle')?.getAttribute('aria-expanded') === 'true'",
-            timeout=5000,
-        )
-
-    search_input = page.locator("input[formcontrolname='appNumber']")
-    if search_input.count() == 0:
-        raise RuntimeError("Search input (formcontrolname='appNumber') not found after expanding accordion.")
-    search_input.first.wait_for(state="visible", timeout=5000)
-    search_input.first.fill(app_number)
-    page.wait_for_timeout(300)
-
-    search_button = page.locator("button:has-text('Search')")
-    if search_button.count() == 0:
-        raise RuntimeError("Search submit button not found.")
-    search_button.first.click()
-    page.wait_for_timeout(2000)
-
-    row_match = page.locator(f"text={entity_name}")
-    if row_match.count() == 0:
-        raise RuntimeError(f"No row found matching entity name '{entity_name}' after search.")
-
-    row = page.locator("tr", has=row_match.first)
-    link = row.locator("a").first
-    if link.count() == 0:
-        raise RuntimeError("Matching row found but it has no clickable link.")
-
-    with page.expect_navigation(timeout=15000):
-        link.click()
-
-    return page.url
-
-
-def download_and_parse_item_details(page) -> list:
-    """Assumes `page` is already on an entity's real public-view-app URL
-    (i.e. right after search_and_open_entity()). Clicks Item Details,
-    clicks Export to Excel, catches the download, parses it, deletes the
-    temp file, and returns the raw item list.
-    """
-    page.click("text=Item Details")
-    page.wait_for_timeout(2000)
-
-    with page.expect_download(timeout=30000) as download_info:
-        page.click("text=Export to Excel")
-    download = download_info.value
-
-    temp_path = os.path.join(ITEM_DOWNLOAD_DIR, f"export_{os.getpid()}_{id(page)}.xlsx")
-    download.save_as(temp_path)
-
-    try:
-        items = parse_item_details_export(temp_path)
-    finally:
-        try:
-            os.remove(temp_path)
-        except OSError:
-            pass
-
-    return items
-
-
-def entity_needs_item_details(filepath: str) -> bool:
-    """True if the entity workbook doesn't exist yet, or any of its
-    segment rows has a blank OPEN/AGPO (column D) value."""
-    if not os.path.exists(filepath):
-        return True
-    try:
-        wb = load_workbook(filepath, data_only=True)
-    except Exception:
-        return True
-
-    ws = wb.active
-    for r in range(3, ws.max_row + 1):
-        col_a = ws.cell(row=r, column=1).value
-        if str(col_a or "").strip().upper() == "TOTAL":
-            continue
-        segment_val = ws.cell(row=r, column=2).value
-        if not segment_val:
-            continue
-        open_agpo_val = ws.cell(row=r, column=4).value
-        if open_agpo_val in (None, ""):
-            return True
-
-    return False
-
-
-def run_item_details_enrichment(file_path=EXCEL_FILE, overwrite=False, delay_seconds=2.0, limit=None):
-    """
-    Standalone step: populates OPEN/AGPO + Q1-Q4 for every entity that
-    needs it. Deliberately separate from run_deep_scrape() — that
-    function's skip logic is keyed on "has a Total Budget", which is
-    unrelated to whether OPEN/AGPO has been populated; almost every
-    entity already has a budget by the time this feature matters, so
-    folding this into run_deep_scrape() would mean it almost never runs.
-
-    `limit`: if set, only processes the first N entities that need
-    enrichment — use this for a small test run before running against
-    everything.
-    """
-    if not check_and_warn_locked_files():
-        input("Press Enter after closing Excel to continue...")
-
-    try:
-        df = pd.read_excel(file_path, sheet_name=TARGET_SHEET)
-    except PermissionError:
-        print(f"[PERMISSION ERROR] Cannot read '{file_path}'. Please close Microsoft Excel.")
-        return
-
-    if "APP Number" not in df.columns or "APP Detail ID" not in df.columns:
-        print("[ERROR] 'latest_entities' missing required columns. Re-run Step 1a first.")
-        return
-
-    processed = 0
-    print("Launching browser to establish authenticated session...")
-    with sync_playwright() as p:
-        browser, context, xsrf = get_authenticated_context(p)
-        page = context.new_page()
-        page.route("**/deskpro-messenger/**", lambda route: route.abort())
-
-        try:
-            for _, row in df.iterrows():
-                if limit is not None and processed >= limit:
-                    print(f"[LIMIT] Reached test limit of {limit} entities. Stopping.")
-                    break
-
-                sr_no = int(row["Sr. No."])
-                entity = str(row["Procuring Entity"]).strip()
-                app_no = str(row["APP Number"]).strip() if pd.notna(row.get("APP Number")) else ""
-                appdetailid = row.get("APP Detail ID")
-
-                if pd.isna(appdetailid) or not app_no:
-                    print(f"[WARNING] Missing APP Detail ID or APP Number for [{sr_no}] {entity}. Skipping.")
-                    continue
-                appdetailid = int(appdetailid)
-
-                target_filepath = os.path.join(PLANS_DIR, f"{sr_no} {entity}.xlsx")
-
-                if not overwrite and not entity_needs_item_details(target_filepath):
-                    print(f"[SKIP] Already enriched: [{sr_no}] {entity}")
-                    continue
-
-                print(f"Enriching [{sr_no}] {entity} (id={appdetailid})...")
-                try:
-                    segments = fetch_entity_segments(context, xsrf, appdetailid)
-
-                    search_and_open_entity(page, app_no, entity)
-                    items = download_and_parse_item_details(page)
-
-                    by_segment = {}
-                    for item in items:
-                        by_segment.setdefault(item["segment_code"], []).append(item)
-
-                    item_data = {
-                        seg: categorize_and_aggregate_items(rows)
-                        for seg, rows in by_segment.items()
-                    }
-
-                    tot = create_entity_template(sr_no, entity, app_no, segments, item_data=item_data)
-                    update_master_budget_totals(entity, tot, status="Partial")
-                    print(f"  -> {len(segments)} segments, {len(items)} items parsed, total KES {tot:,.2f}")
-                    processed += 1
-
-                except Exception as e:
-                    print(f"[ERROR] Failed item-details enrichment for [{sr_no}] {entity}: {e}")
-
-                time.sleep(delay_seconds)
-        finally:
-            browser.close()
-
-    print(f"\nDone. Enriched {processed} entities.")
-
-
-if __name__ == "__main__":
-    reconcile_budget_totals_from_workbooks()

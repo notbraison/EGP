@@ -1,8 +1,8 @@
-An end-to-end automated Python pipeline that pulls public annual procurement plan data from the Kenya e-GP portal (https://egpkenya.go.ke/public-app) via its internal JSON API, updates a multi-sheet local master Excel file (Procuring_Entities.xlsx), generates individual formatted entity procurement plan workbooks (./entity_plans/), enriches contact and address details via targeted web searches, and synchronizes the live dataset to Google Workspace Sheets via Google Apps Script Web App endpoints — with Status/Prequalification edits round-tripping back from a human collaborator working directly in Google Sheets.
+An end-to-end automated Python pipeline that pulls public annual procurement plan data from the Kenya e-GP portal (https://egpkenya.go.ke/public-app) via its internal JSON API, updates a multi-sheet local master Excel file (Procuring_Entities.xlsx), generates individual formatted entity procurement plan workbooks (./entity_plans/), enriches contact and address details via concurrent web searches, and synchronizes the live dataset to Google Workspace Sheets via Google Apps Script Web App endpoints — with Status/Prequalification edits round-tripping back from a human collaborator working directly in Google Sheets.
 
 Sheet Schema & Workbook Architecture (Procuring_Entities.xlsx)
 
-latest_entities: Master scraped dataset containing 6 columns: Sr. No., Financial Year, Procuring Entity, APP Number, APP URL, and APP Detail ID (the numeric appdetailid returned by the portal's API — this is the key used for all deep-scrape calls; no other identifier is needed).
+latest_entities: Master scraped dataset containing 6 columns: Sr. No., Financial Year, Procuring Entity, APP Number, APP URL, and APP Detail ID (the numeric appdetailid returned by the portal's API — this is the key used for all deep-scrape calls; no other identifier is needed). APP Number additionally doubles as the search key for the Item Details feature's click-through navigation (see below) — the portal's own search UI filters by this field.
 
 latest_entities_only: Streamlined dataset containing 2 columns: Sr. No. and Procuring Entity.
 
@@ -14,18 +14,18 @@ Column 2 (B): Procuring Entity
 
 Column 3 (C): Total Budget — formatted as "KES" #,##0.00 everywhere it is written.
 
-Column 4 (D): Status — one of "Pending" (no fill), "Partial" (amber fill #FFF2CC, text #9C6500, bold — set automatically once deep scrape successfully pulls segment/cost data for an entity), or "Done" (green fill #E2EFDA, text #375623, bold — reserved for once OPEN/AGPO and Q1–Q4 data exists; nothing in the current pipeline sets this automatically).
+Column 4 (D): Status — one of "Pending" (no fill), "Partial" (amber fill #FFF2CC, text #9C6500, bold — set automatically once deep scrape successfully pulls segment/cost data for an entity), or "Done" (green fill #E2EFDA, text #375623, bold — reserved for once OPEN/AGPO and Q1–Q4 data exists; nothing in the pipeline sets this automatically, and this remains true even with the Item Details feature shipped — a segment can legitimately compute to all-blank/'0' because it has no qualifying RFQ/Open Tender items, which is not the same thing as "not yet computed").
 
 Column 5 (E): Prequalification done — left blank by the pipeline. This is a manual field maintained by a human collaborator directly in the Google Sheet; the local pipeline pulls it (and Status) down before recomputing, and pushes both back up unchanged alongside the freshly computed Total Budget, so collaborator edits are never overwritten.
 
-blacklisted: 2-column visibility sheet (Sr. No., Procuring Entity) listing every entity excluded by the blacklist filter during Light Scrape — county-level entities, county assemblies, and the explicit BLACKLIST_ENTITIES set. Purpose: let collaborators see what's being excluded and why, without digging into code. Currently populated FROM the hardcoded blacklist (one-way); a planned follow-up will invert this so the blacklist itself is sourced FROM this sheet instead of being hardcoded.
+blacklisted: 2-column visibility sheet (Sr. No., Procuring Entity) listing every entity excluded by the blacklist filter during Light Scrape — county-level entities, county assemblies, and the explicit BLACKLIST_ENTITIES set. Currently populated FROM the hardcoded blacklist (one-way); a planned follow-up will invert this so the blacklist itself is sourced FROM this sheet instead of being hardcoded — not yet built.
 
-addresses: Visits & Contact Tracker (9 columns) containing entity names, physical addresses, towns, counties, phones, assigned officers, and visit tracking.
+addresses: Visits & Contact Tracker (9 columns) containing entity names, physical addresses, towns, counties, phones, assigned officers, and visit tracking. Blacklisted entities are excluded before any search is attempted.
 
 Dedicated Directory (./entity_plans/)
 Holds individual formatted Excel workbooks generated per approved procuring entity (e.g., ./entity_plans/20 PEST CONTROL PRODUCTS BOARD.xlsx).
 
-8-column layout per workbook: Sr. No., Segment, Total Cost, OPEN/AGPO, Q1, Q2, Q3, Q4. Only Sr. No./Segment/Total Cost are currently populated (via the API's view-app-summary endpoint); OPEN/AGPO and Q1–Q4 are written as blank strings, not 0.0, so it's visually clear in Excel that they're genuinely unpopulated rather than zero. Populating these is deferred to a second implementation phase (likely sourced from the portal's "Item Details" tab, not yet reverse-engineered). Workbooks contain merged banners, a dynamic =SUM() formula on the Total Cost column, standard headers, thin borders, and "#,##0.00" cell formatting, generated via openpyxl.
+8-column layout: Sr. No., Segment, Total Cost, OPEN/AGPO, Q1, Q2, Q3, Q4. Sr. No./Segment/Total Cost are populated by Stage 2 (Deep Scrape, pure API). OPEN/AGPO and Q1–Q4 are populated by the Item Details feature (see section 7 below) when that step is run — when it hasn't been run for an entity, these are written as blank strings (not 0.0), so it's visually clear in Excel that they're genuinely unpopulated rather than zero. Workbooks contain merged banners, a dynamic =SUM() formula on the Total Cost column, standard headers, thin borders, and "#,##0.00" cell formatting, generated via openpyxl.
 
 Pipeline Architecture & Module Responsibilities
 
@@ -40,61 +40,98 @@ CLI menu loop supporting isolated module testing and end-to-end automation:
 
 [4] Budget Tracker (Step 2): Pulls Status/Prequal from the live Google Sheet first, then re-indexes and schema-aligns the local Budget Totals sheet.
 
-[5] Address Tracker (Step 3): Contact enrichment via Bing searching.
+[5] Address Tracker (Step 3): Contact enrichment via concurrent Bing searching.
 
 [6] GSuite Sync (Step 4): Pushes Budget Totals, addresses, and blacklisted sheets to their Google Sheets endpoints.
 
 [7] Full Pipeline, skipping Step 3 (Addresses).
 
-[8] Reconcile Budget Totals from entity workbooks — standalone audit tool that recomputes each entity's Total Budget by re-reading its actual workbook file on disk, as a cross-check against what deep scrape wrote directly. Not part of the automated full-pipeline run; run on demand.
+[8] Reconcile Budget Totals from entity workbooks — standalone audit tool that recomputes each entity's Total Budget by re-reading its actual workbook file on disk.
 
-2. Scraping Engine (scrape_entities.py) — API-based, not DOM scraping
-The portal (egpkenya.go.ke/public-app) is a production Angular build. Click handlers are bound via framework directives, not literal onclick attributes, so there is nothing in the DOM to regex against — this was the original (broken) approach and has been fully replaced. The site also sits behind bot protection: plain requests calls get 403 with no cookies set, even on a simple GET. The working approach is a hybrid:
+Item Details enrichment (run_item_details_enrichment(), section 7 below) is not yet wired into the main.py menu — it exists in scrape_entities.py and is currently invoked directly for testing, not via a menu option.
 
-get_authenticated_context(): Launches a real Playwright/Chromium session once, loads the public-app page (blocking the Deskpro live-chat widget, which otherwise prevents wait_until="networkidle" from ever resolving — domcontentloaded + explicit wait_for_selector is used instead), and extracts the XSRF-TOKEN cookie the Angular app sets. This cookie plus an X-XSRF-TOKEN header is all that's needed to authenticate subsequent calls.
+2. Scraping Engine (scrape_entities.py) — API-based for listing/segments, browser-automated for Item Details
+The portal (egpkenya.go.ke/public-app) is a production Angular build. Click handlers are bound via framework directives, not literal onclick attributes. The site also sits behind bot protection: plain requests calls get 403 with no cookies set, even on a simple GET.
 
-api_post(): Fires JSON POSTs through that same authenticated Playwright browser context (context.request.post(...)) — real browser session, but no clicking, no DOM waits, no per-row navigation.
+get_authenticated_context(): Launches a real Playwright/Chromium session once, loads the public-app page (blocking the Deskpro live-chat widget — see Site Quirks), and extracts the XSRF-TOKEN cookie. Currently hardcoded headless=True.
 
-fetch_all_entity_records(): Pulls the full entity/APP listing via POST /api/app/public-app-detail, paginating deterministically using the totalCount field embedded in every response (no trial-and-error page-size probing).
+api_post(): Fires JSON POSTs through that same authenticated Playwright browser context (context.request.post(...)).
 
-fetch_entity_segments(): Pulls per-entity procurement segments via POST /api/app/view-app-summary, keyed by appDetailId, again paginating via the response's totalcount.
+fetch_all_entity_records(): Pulls the full entity/APP listing via POST /api/app/public-app-detail, paginating via the totalCount field.
 
-Note: POST /api/app/get-app-details/{id} exists but is deliberately never called — it returns real user PII (login ID, email, phone, bcrypt password hash of the officer who created the plan) and has no legitimate use in this pipeline.
+fetch_entity_segments(): Pulls per-entity procurement segments via POST /api/app/view-app-summary, keyed by appDetailId. Captures segment_code (the raw unspscsegment field, e.g. "44000000") alongside segment/total_cost — this is the join key the Item Details feature uses to map items back to their parent segment.
 
-Dual-Layer Blacklisting: is_blacklisted() filters out county-level entities, county assemblies, and non-paying authorities using an explicit BLACKLIST_ENTITIES set plus string-pattern matching (e.g., "COUNTY", leading county codes like "4815 KAKAMEGA"). Every entity this function excludes during Light Scrape is now also logged to the blacklisted sheet for visibility.
+Note: POST /api/app/get-app-details/{id} exists but is deliberately never called — it returns real user PII.
 
-Stage 1 (Light Scrape / scrape_to_latest_entities()): Pulls the full listing via the API, applies the blacklist (recording exclusions), and writes clean records to latest_entities, latest_entities_only, Budget Totals, and blacklisted, then saves.
+Dual-Layer Blacklisting: is_blacklisted() filters county-level entities, county assemblies, and the explicit BLACKLIST_ENTITIES set. Every excluded entity is logged to the blacklisted sheet, and address_tracker.py filters against the same function before performing any search.
 
-Stage 2 (Deep Scrape / run_deep_scrape()): Skips entities already marked "Partial"/"Done" or with Total Budget > 0 (should_skip_entity()). For active entities, fetches segments directly via API using the stored APP Detail ID — no navigation, no clicking — builds the workbook via create_entity_template(), and writes the computed total back with status "Partial".
+Stage 1 (Light Scrape / scrape_to_latest_entities()): Pulls the full listing via the API, applies the blacklist, writes latest_entities, latest_entities_only, Budget Totals, and blacklisted, then saves.
 
-Workbook Sync & Purge (sync_and_rename_workbooks()): Re-indexes ./entity_plans/ filenames when portal ordering shifts using normalized alphanumeric keys ("".join(c for c in name.upper() if c.isalnum())), and deletes orphan/blacklisted .xlsx files.
+Stage 2 (Deep Scrape / run_deep_scrape()): Skips entities already marked "Partial"/"Done" or with Total Budget > 0. Fetches segments via API, builds the workbook via create_entity_template(), writes status "Partial". Pure API, no browser navigation. Does NOT populate OPEN/AGPO/Q1–Q4 — that's a separate step (section 7).
 
-Reconciliation (reconcile_budget_totals_from_workbooks()): Re-derives each entity's total directly from its workbook file on disk (summing column C, skipping "TOTAL" label rows and formula-text cells), and only ever promotes Pending→Partial on a nonzero total — never touches an existing "Done" and never downgrades. A safety-net audit path independent of whatever update_master_budget_totals() wrote during deep scrape.
+Workbook Sync & Purge (sync_and_rename_workbooks()): Re-indexes ./entity_plans/ filenames when portal ordering shifts, deletes orphan/blacklisted .xlsx files.
+
+Reconciliation (reconcile_budget_totals_from_workbooks()): Re-derives each entity's total from its workbook file on disk. Only ever promotes Pending→Partial on a nonzero total. Exposed as menu option [8].
 
 3. Budget Alignment (budget_tracker.py)
-pull_status_from_gsheet(): Runs first. Fetches the live Google Sheet (GET request to the Apps Script Web App) and pulls Status + Prequalification done (columns D/E) into the local file, without touching Total Budget. This must run before any local recompute so a human collaborator's edits in Google Sheets are never clobbered.
+pull_status_from_gsheet(): Fetches the live Google Sheet and pulls Status + Prequalification done into the local file first, before any local recompute, so collaborator edits are never clobbered.
 
-update_budget_totals(): Re-indexes Budget Totals against latest_entities (data starts at row 2 — one header row only), preserving Total Budget/Status/Prequal already present, reformatting Total Budget as KES currency, and applying conditional fill/font styling to the Status column (green for "Done", amber for "Partial", plain otherwise).
+update_budget_totals(): Re-indexes Budget Totals against latest_entities (data starts row 2), preserving Total Budget/Status/Prequal, reformatting currency, applying Status conditional styling.
 
 4. Address Enrichment (address_tracker.py)
-Unchanged from the original design — independent of the API rewrite above. Scans addresses for empty fields (physical address, town, county, phone, email), performs headless Bing searches with custom User-Agents and batch delays, extracts contacts via regex, prefixes phone numbers with ' to preserve leading zeros in Excel, and strips out blacklisted entity rows.
+Rewritten for speed: blacklist pre-filter before any search, batched wb.save() every 10 completions instead of every 1, and concurrency across MAX_WORKERS=4 threads — each thread owning its own complete Playwright/browser/context/page lifecycle internally (Playwright's sync API is pinned to the thread that created it; sharing pages across threads via a queue fails with greenlet.error). Result: 108 non-blacklisted entities (64 searched) in ~88 seconds, down from 45+ minutes.
 
 5. Live Cloud Synchronization (sync_gsuite.py)
-Reads local Excel sheets and POSTs JSON payloads (including a sheetName field so the Apps Script backend can route to the correct tab) to Google Apps Script Web App endpoints using standard urllib.request. Pushes 5 columns for Budget Totals and 2 columns for blacklisted (both via BUDGET_SHEET_URL, same spreadsheet, different tabs) and 9 columns for addresses (VISITS_SHEET_URL).
+POSTs JSON payloads (with a sheetName field for routing) to Google Apps Script Web App endpoints. Pushes Budget Totals (5 cols), blacklisted (2 cols, same spreadsheet), addresses (9 cols). Entity workbooks are never synced to Sheets — this includes the Item Details feature's output, which stays purely local.
 
 6. Backend Integration (Google Apps Script — code.gs, project "egp-scraper-updater")
-doPost(e): Reads sheetName from the payload (defaulting to "Budget Totals") and routes to the correct tab, creating it if absent. Uses sheet.clearContents() to update data values without destroying formatting, title banners, header colors, or column widths. Budget-Totals-specific formatting (border/alignment template copy + Done/Partial status highlighting) is applied only when sheetName === "Budget Totals"; other sheets (e.g. blacklisted) receive plain values only.
+doPost(e): Routes by sheetName, clears + rewrites the target sheet, reapplies formatting/status highlighting only for Budget Totals.
 
-doGet(e): Top-level sibling function (not nested inside doPost — an earlier version had this bug, which silently broke pull_status_from_gsheet() since Apps Script requires both to be global). Accepts an optional ?sheet= query param (defaulting to "Budget Totals") and returns that sheet's full data range as JSON — this is what pull_status_from_gsheet() reads.
+doGet(e): Top-level sibling function, accepts optional ?sheet= param, returns that sheet's data as JSON — this is what pull_status_from_gsheet() reads.
+
+7. Item Details / OPEN-AGPO Feature (implemented, tested on one entity end-to-end, not yet run at scale)
+
+Fills the entity workbook's OPEN/AGPO, Q1, Q2, Q3, Q4 columns.
+
+Business rule (confirmed, validated at full scale against one entity — 3,246 items / 55 segments, zero broken edge cases): for each item in an entity's Item Details export, filter to Procurement Method in {"Request for Quotation", "Open Tender"}, dropping everything else. Open Tender items are always tagged OPEN (confirmed they never carry an AGPO reservation in the source data). Request for Quotation items with a blank Reservation Group are tagged RFQ. Request for Quotation items with Reservation Group = "AGPO" are tagged RFQ plus whichever of Women/Youth/PWD has nonzero quantity (exactly one of the three has ever been nonzero, across every row checked so far — one entity's data, not exhaustively cross-checked). Per quarter, per segment: write the union of tags among items with nonzero quantity that quarter, fixed order (OPEN, RFQ, RFQ WOMEN, RFQ YOUTH, RFQ PWD), comma-separated, or '0' if empty. The OPEN/AGPO summary column is the same union across all four quarters combined.
+
+Data source: one "Export to Excel" click on an entity's Item Details tab downloads every item across every segment for that entity in a single file (confirmed: one Eldoret download returned all 3,246 items / 55 segments at once — this is entity-scoped, not segment-scoped, despite the button living inside a per-segment-looking tab). Each item's segment is derived for free from its UNSPSC/Item Code (first 2 digits = segment code, by UNSPSC definition), matching the segment_code field fetch_entity_segments() now captures.
+
+Navigation chain (solved, tested headless end-to-end for one entity, including a real selector bug found and fixed):
+1. latest_entities' stored hash-less APP URL does not work — silently redirects to the homepage, no error thrown. Never navigate to it directly.
+2. The real hashed public-view-app URL is only obtainable via the portal's own search UI: expand a collapsed accordion (button#first-toggle, verified via aria-expanded flipping to "true", not a blind wait), fill the search input (input[formcontrolname='appNumber'], using the APP Number already stored in latest_entities), click Search, click the resulting row, land on the real URL.
+3. BUG FOUND AND FIXED: the accordion toggle button's own visible text is also "Search" (it reads "🔍 Search" as its collapsed-state label). A selector of button:has-text('Search') therefore matches BOTH the accordion toggle and the real submit button, and Playwright's .first silently grabbed the wrong one — the search field was being filled correctly but the click just re-toggled the accordion, so the table always kept showing its unfiltered default first page. This produced a false-positive test earlier (searching for Eldoret "worked" only because Eldoret happens to be the first row of the default unfiltered listing). Diagnosed by dumping the actual row list after two DIFFERENT searches and finding they returned identical (unfiltered) results. Root cause confirmed via DevTools: the real submit button has type="submit", the accordion toggle does not. Fix: selector changed to button[type='submit']:has-text('Search'), which returns exactly 1 element. Verified: search for "AWWDA/704/APP/2026-27/2" now correctly returns exactly 1 row (Athi Water Works Development Agency), not the default 10.
+4. From the real hashed URL: click "Item Details" tab, click "Export to Excel", catch the download via page.expect_download(), parse the file, delete it.
+
+Functions implemented in scrape_entities.py:
+- derive_segment_code(item_code) — UNSPSC first-2-digits → segment code.
+- tag_for_item(item) — per-item categorization per the business rule.
+- categorize_and_aggregate_items(items) — pure function, one segment's items → {open_agpo, q1, q2, q3, q4}. No API/browser dependency.
+- parse_item_details_export(filepath) — reads a downloaded .xlsx into raw item dicts.
+- search_and_open_entity(page, app_number, entity_name) — the navigation chain above, including the fixed submit-button selector. Raises clear RuntimeErrors (not silent failures) if the accordion, search input, submit button, matching row, or its link aren't found.
+- download_and_parse_item_details(page) — Item Details tab → Export → download → parse → delete temp file.
+- entity_needs_item_details(filepath) — checks whether a workbook is missing or has any segment row with a blank OPEN/AGPO cell.
+- run_item_details_enrichment(file_path, overwrite, delay_seconds, limit) — the orchestrating loop: per entity, fetches segments via API, runs the navigation+download+parse chain, merges results by segment_code, regenerates the workbook via create_entity_template() (now accepting an optional item_data param), updates Budget Totals status to "Partial". Includes a delay_seconds pause between entities (default 2.0s) and an optional limit param for small test runs before running against the full entity list. Deliberately kept separate from run_deep_scrape() — that function's skip logic is keyed on "has a Total Budget," unrelated to whether OPEN/AGPO has been populated, so folding this in would mean it almost never actually runs once most entities already have a budget.
+
+create_entity_template() updated: now accepts an optional item_data dict ({segment_code: {open_agpo, q1, q2, q3, q4}}); when a segment's code isn't found in item_data (enrichment not yet run, or failed for that entity), falls back to blank strings — unchanged behavior from before this feature existed.
+
+Not yet done: tested against only one entity (Eldoret) for the full chain; Athi Water Works only had its raw export inspected manually, not the full automated navigation. Generalization across entities with different page structures, zero segments, or a missing Export button is unverified. No rate-limiting has been validated at scale beyond the default 2s delay. Not wired into main.py's menu yet — run manually. Whether the "exactly one of Women/Youth/PWD nonzero" pattern and the "no non-RFQ/Open-Tender method ever has nonzero W/Y/PWD" assumption hold across entities generally (not just Eldoret) is still unverified.
 
 Core Technical Standards & Rules
 
-Excel File Locking: All target .xlsx files must be closed in Microsoft Excel before running Python write or rename operations, to prevent PermissionError exceptions. check_and_warn_locked_files() detects and clears orphaned ~$*.xlsx lock files automatically, and warns/blocks on genuinely active locks.
+Excel File Locking: All target .xlsx files must be closed in Microsoft Excel before running Python write or rename operations. check_and_warn_locked_files() detects and clears orphaned ~$*.xlsx lock files automatically.
 
-No DOM Scraping / No Clicking: The portal's procurement listing and detail pages are Angular SPA views with no navigable onclick attributes and no full-page navigation on interaction visible to the DOM. All data retrieval goes through the site's internal JSON API (see Scraping Engine above), authenticated via a real Playwright browser session's XSRF cookie — never plain requests (blocked by bot protection) and never DOM table walking (fragile, and the underlying data isn't reliably present in the rendered HTML in the first place).
+No DOM Scraping / No Clicking (for listing/segment data): Entity listing and segment summaries go through the site's internal JSON API, authenticated via a real Playwright browser session's XSRF cookie. The Item Details feature (section 7) is a deliberate, scoped exception — it uses real Playwright clicks because the underlying Excel-export mechanism has no equivalent JSON API found or expected to exist.
 
-Site Quirks: Never use wait_until="networkidle" against this site — a persistent Deskpro live-chat widget keeps a connection open indefinitely, so networkidle never resolves. Use domcontentloaded plus an explicit wait_for_selector, and block the widget's requests via page.route(...).
+Site Quirks:
+- Never use wait_until="networkidle" — the Deskpro live-chat widget keeps a persistent connection open, so it never resolves. Use domcontentloaded + explicit wait_for_selector.
+- BUT do not block the Deskpro widget's own network requests when doing anything beyond the initial authenticated session load — blocking it (page.route(...).abort() on its URL pattern) causes an uncaught TypeError inside the widget's own JS, which propagates through Angular's shared zone.js task queue and can silently break unrelated in-flight requests on the same page (confirmed: this caused the Item Details table to show "No Records Found" even after a successful click, with zero errors surfaced to Playwright). Only block it during get_authenticated_context()'s one-time initial load; leave it unblocked for any page where you need other requests/rendering to complete reliably afterward.
+- Never navigate directly to the hash-less public-view-app/{id}/{mode}/ URL format — it silently redirects to the homepage instead of erroring.
+- Never hard-refresh (F5) a public-view-app page mid-session — this SPA relies on in-memory navigation state a refresh doesn't have; observed to hang and crash the browser rather than reload cleanly. Always arrive via the click-through flow; if something looks wrong, close and restart the whole browser session instead of refreshing.
+- Ambiguous text-based selectors are a real, repeated risk on this site — button:has-text('Search') matched two different elements (accordion toggle vs. real submit button) and silently picked the wrong one with no error, producing a false-positive test result. Prefer a more specific attribute (type='submit', a specific id, aria attributes) over text-only matching wherever more than one element could plausibly share the same visible text.
 
-Google Sheets as Partial Source of Truth: Status and Prequalification done in Budget Totals are authoritative on the Google Sheet side (edited by a human collaborator) — the local pipeline pulls them down before every recompute and pushes them back up unchanged afterward, alongside freshly computed Total Budget values. No other column follows this pattern.
+Playwright Thread Safety: Playwright's sync API is pinned to the OS thread that created it. Concurrent Playwright work must give each thread its own fully self-contained sync_playwright()/browser/context/page.
 
-Delta Operations: Maintain character normalization ("".join(c for c in string.upper() if c.isalnum())) across all scripts (normalize_key()) to reliably join datasets, preserve manual entries, and prevent duplicate files or duplicate sheet rows.
+Google Sheets as Partial Source of Truth: Status and Prequalification done in Budget Totals are authoritative on the Google Sheet side. The local pipeline pulls them down before every recompute and pushes them back up unchanged afterward.
+
+Delta Operations: Maintain character normalization ("".join(c for c in string.upper() if c.isalnum())) across all scripts (normalize_key()) to reliably join datasets and prevent duplicates.
