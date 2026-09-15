@@ -1,14 +1,17 @@
-## scrape_entities.py
+## scrape_entities.py   is being used for tests at the moment 
 import os
 import re
 import json
 import time
 import openpyxl
 import pandas as pd
+import urllib.request
+import datetime
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from playwright.sync_api import sync_playwright
+from sync_gsuite import BUDGET_SHEET_URL
 
 EXCEL_FILE = "Procuring_Entities.xlsx"
 TARGET_SHEET = "latest_entities"
@@ -19,14 +22,13 @@ API_BASE = "https://egpkenya.go.ke/api/app"
 CURRENCY_FORMAT = '"KES" #,##0.00'
 BLACKLISTED_SHEET = "blacklisted"
 ITEM_DOWNLOAD_DIR = "./temp_downloads"
-TAG_ORDER = ["OPEN", "RFQ", "RFQ WOMEN", "RFQ YOUTH", "RFQ PWD"]
+BIG_TICKET_THRESHOLD = 200000.0
 
 os.makedirs(PLANS_DIR, exist_ok=True)
 os.makedirs(ITEM_DOWNLOAD_DIR, exist_ok=True)
 
 BLACKLIST_ENTITIES = {
     "OL KALOU TECHNICAL AND VOCATIONAL COLLEGE",
-    "THIKA WATER AND SEWERAGE COMPANY LTD",
     "KAPSABET NANDI WATER AND SANITATION COMPANY LTD",
     "TECHNICAL AND VOCATIONAL EDUCATION AND TRAINING AUTHORITY",
     "KARATINA UNIVERSITY",
@@ -69,7 +71,49 @@ BLACKLIST_ENTITIES = {
 }
 
 
-def is_blacklisted(entity_name: str) -> bool:
+# In-process cache: the current run's authoritative blacklist, as a set of
+# normalize_key()'d entity names. Populated either by scrape_to_latest_entities()
+# (which pulls fresh from Google Sheets) or lazily from the local 'blacklisted'
+# sheet when is_blacklisted() is called standalone (e.g. from address_tracker.py)
+# without a light scrape having run first in this process.
+_blacklist_cache = None
+
+
+def pull_blacklist_from_gsheet(sheet_url=None):
+    """Fetches the current blacklist entity list directly from the
+    'blacklisted' tab in Google Sheets. This is the authoritative list —
+    removing an entity here permanently un-blacklists it (even if it
+    still matches the COUNTY pattern or the legacy hardcoded set), and
+    adding one here blacklists it, going forward. Returns a set of
+    normalize_key()'d names, or None if the fetch failed (caller should
+    fall back to the last known local copy rather than treat this as
+    "empty list").
+    """
+    base_url = sheet_url or BUDGET_SHEET_URL
+    sep = "&" if "?" in base_url else "?"
+    url = f"{base_url}{sep}sheet=blacklisted"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            payload = json.loads(resp.read().decode())
+    except Exception as e:
+        print(f"[WARNING] Could not fetch blacklist from Google Sheet: {e}")
+        return None
+
+    rows = payload.get("data", [])[1:]  # skip header row
+    names = set()
+    for row in rows:
+        if len(row) >= 2 and row[1]:
+            names.add(normalize_key(row[1]))
+    return names
+
+
+def _auto_detect_blacklist(entity_name: str) -> bool:
+    """Heuristic used ONLY to seed the blacklist the first time an entity
+    is ever seen. Once an entity has been classified in any prior run
+    (blacklisted or not), the Google Sheet decides — this is never
+    consulted again for it, so removing it from the sheet permanently
+    un-blacklists it even if it still matches these patterns.
+    """
     clean_name = str(entity_name).strip()
     upper_name = clean_name.upper()
 
@@ -80,6 +124,53 @@ def is_blacklisted(entity_name: str) -> bool:
     if clean_name and clean_name[0].isdigit() and ("-" in clean_name[:6] or " " in clean_name[:6]):
         return True
     return False
+
+
+def _set_blacklist_cache(entity_names):
+    global _blacklist_cache
+    _blacklist_cache = {normalize_key(n) for n in entity_names}
+
+
+def _load_blacklist_cache_from_local_file(file_path=EXCEL_FILE):
+    """Fallback loader: reads whatever 'blacklisted' sheet is already in
+    the local workbook (last known good list from the previous run's
+    Google Sheets pull). Used when is_blacklisted() is called without a
+    fresh light scrape having populated the cache in this process yet.
+    """
+    global _blacklist_cache
+    if _blacklist_cache is not None:
+        return
+
+    names = set()
+    if os.path.exists(file_path):
+        try:
+            wb = load_workbook(file_path, data_only=True)
+            if BLACKLISTED_SHEET in wb.sheetnames:
+                ws = wb[BLACKLISTED_SHEET]
+                for r in range(2, ws.max_row + 1):
+                    entity = ws.cell(row=r, column=2).value
+                    if entity:
+                        names.add(normalize_key(entity))
+        except Exception:
+            pass
+
+    if not names:
+        # Last-resort fallback: the legacy hardcoded set, so is_blacklisted()
+        # never returns wrong answers just because no file exists yet.
+        names = {normalize_key(n) for n in BLACKLIST_ENTITIES}
+
+    _blacklist_cache = names
+
+
+def is_blacklisted(entity_name: str) -> bool:
+    """Checks the current run's blacklist cache. Google Sheets is the
+    source of truth (see scrape_to_latest_entities() for how the cache
+    gets populated from there); the hardcoded set and pattern matching
+    are only ever used to auto-seed a BRAND NEW entity's initial
+    classification, never to override an explicit removal from the sheet.
+    """
+    _load_blacklist_cache_from_local_file()
+    return normalize_key(entity_name) in _blacklist_cache
 
 
 def normalize_key(name: str) -> str:
@@ -228,6 +319,20 @@ def fetch_all_entity_records(context, xsrf, page_size=100):
 
     return all_records
 
+def fetch_entity_created_date(context, xsrf, appdetailid):
+    """Returns the entity's real creation date on the portal (YYYY-MM-DD),
+    from get-appdetail-summary — NOT get-app-details, which leaks PII and
+    is never called anywhere in this pipeline. Returns "" if unavailable.
+    """
+    try:
+        result = api_post(context, xsrf, f"get-appdetail-summary/{appdetailid}")
+    except Exception:
+        return ""
+    rows = result.get("reportdata", [])
+    if not rows:
+        return ""
+    return str(rows[0].get("createdon", "")).strip()
+
 
 def fetch_entity_segments(context, xsrf, appdetailid, page_size=10):
     """Pulls every procurement segment for an entity via view-app-summary.
@@ -275,7 +380,20 @@ def fetch_entity_segments(context, xsrf, appdetailid, page_size=10):
 # ---------------------------------------------------------------------------
 
 def scrape_to_latest_entities(file_path=EXCEL_FILE):
-    """Light Scrape: Pulls all entity/APP records via direct API calls, filters blacklist."""
+    """Light Scrape: Pulls all entity/APP records via direct API calls.
+
+    Blacklist source of truth: Google Sheets' 'blacklisted' tab, pulled
+    fresh at the start of every run. An entity is blacklisted this run
+    if and only if:
+      - it's in the freshly-pulled sheet list, OR
+      - it has NEVER been classified before (not present in the previous
+        run's latest_entities or blacklisted sheet) AND matches the
+        legacy auto-detection heuristic (COUNTY pattern / hardcoded set).
+    Any entity previously seen and NOT currently in the sheet is treated
+    as explicitly un-blacklisted, even if it would still match the
+    heuristic — this is what makes removing an entity from the sheet
+    actually stick permanently.
+    """
     if not check_and_warn_locked_files():
         input("Press Enter after closing Excel to continue...")
 
@@ -293,13 +411,74 @@ def scrape_to_latest_entities(file_path=EXCEL_FILE):
         print("No valid records scraped.")
         return
 
+    # 0. Read prior-run state before anything gets overwritten:
+    #    - existing Date Added values, to preserve them across runs
+    #    - the set of entities already classified before (whether they
+    #      ended up blacklisted or not), so brand-new entities can be
+    #      told apart from ones the sheet has already decided on
+    today_str = datetime.date.today().isoformat()
+    existing_dates = {}
+    previously_classified = set()
+
+    if os.path.exists(file_path):
+        try:
+            old_wb = load_workbook(file_path, data_only=True)
+        except Exception:
+            old_wb = None
+
+        if old_wb is not None:
+            if TARGET_SHEET in old_wb.sheetnames:
+                old_sheet = old_wb[TARGET_SHEET]
+                old_header = [old_sheet.cell(row=1, column=c).value for c in range(1, old_sheet.max_column + 1)]
+                if "Procuring Entity" in old_header:
+                    entity_col = old_header.index("Procuring Entity") + 1
+                    appnum_col = old_header.index("APP Number") + 1 if "APP Number" in old_header else None
+                    date_col = old_header.index("Date Added") + 1 if "Date Added" in old_header else None
+                    for r in range(2, old_sheet.max_row + 1):
+                        old_entity = old_sheet.cell(row=r, column=entity_col).value
+                        if not old_entity:
+                            continue
+                        previously_classified.add(normalize_key(old_entity))
+                        if date_col and appnum_col:
+                            old_appnum = old_sheet.cell(row=r, column=appnum_col).value
+                            old_date = old_sheet.cell(row=r, column=date_col).value
+                            if old_date:
+                                existing_dates[(str(old_entity).upper(), str(old_appnum or "").upper())] = old_date
+
+            if BLACKLISTED_SHEET in old_wb.sheetnames:
+                old_bl = old_wb[BLACKLISTED_SHEET]
+                for r in range(2, old_bl.max_row + 1):
+                    old_entity = old_bl.cell(row=r, column=2).value
+                    if old_entity:
+                        previously_classified.add(normalize_key(old_entity))
+
+    # 1. Pull the authoritative blacklist from Google Sheets. If the fetch
+    # fails (offline, Apps Script down, etc.), fall back to whatever's
+    # already in the local file rather than treating it as an empty list.
+    print("Pulling current blacklist from Google Sheet...")
+    sheet_blacklist = pull_blacklist_from_gsheet()
+    if sheet_blacklist is None:
+        print("[WARNING] Using last local blacklist copy — could not reach Google Sheets.")
+        _load_blacklist_cache_from_local_file(file_path)
+        sheet_blacklist = set(_blacklist_cache) if _blacklist_cache else set()
+
+    # 2. Classify every raw record.
     scraped_data = []
     blacklisted_seen = []
     for rec in records:
         entity = str(rec.get("procuringentity", "")).strip()
         if not entity:
             continue
-        if is_blacklisted(entity):
+
+        key = normalize_key(entity)
+        if key in sheet_blacklist:
+            is_bl = True
+        elif key in previously_classified:
+            is_bl = False  # previously seen, not currently in sheet -> stays un-blacklisted
+        else:
+            is_bl = _auto_detect_blacklist(entity)  # brand new -> seed via heuristic
+
+        if is_bl:
             blacklisted_seen.append(entity)
             continue
 
@@ -324,6 +503,23 @@ def scrape_to_latest_entities(file_path=EXCEL_FILE):
         print("No valid records scraped.")
         return
 
+    # 3. Fetch each entity's real creation date from the portal (skipped
+    # for entities we already have a stored date for, to save calls).
+    print(f"Fetching creation dates for {len(unique_records)} entities...")
+    with sync_playwright() as p:
+        browser2, context2, xsrf2 = get_authenticated_context(p)
+        try:
+            dated_records = []
+            for fin_year, entity, app_num, app_url, appdetailid in unique_records:
+                key = (entity.upper(), str(app_num).upper())
+                if key in existing_dates:
+                    created_date = existing_dates[key]
+                else:
+                    created_date = fetch_entity_created_date(context2, xsrf2, appdetailid) or today_str
+                dated_records.append((fin_year, entity, app_num, app_url, appdetailid, created_date))
+        finally:
+            browser2.close()
+
     try:
         wb = (
             openpyxl.load_workbook(file_path)
@@ -334,31 +530,33 @@ def scrape_to_latest_entities(file_path=EXCEL_FILE):
         print(f"[PERMISSION ERROR] '{file_path}' is open in Excel. Close it and try again.")
         return
 
-    # 1. Populate 'latest_entities' (6 columns, incl. APP Detail ID)
+    # 4. Populate 'latest_entities' (7 columns, incl. APP Detail ID + Date Added).
     if TARGET_SHEET in wb.sheetnames:
         del wb[TARGET_SHEET]
     s_full = wb.create_sheet(TARGET_SHEET)
     s_full.append(
-        ["Sr. No.", "Financial Year", "Procuring Entity", "APP Number", "APP URL", "APP Detail ID"]
+        ["Sr. No.", "Financial Year", "Procuring Entity", "APP Number", "APP URL", "APP Detail ID", "Date Added"]
     )
-    for i, (fin_year, entity, app_num, app_url, appdetailid) in enumerate(unique_records, start=1):
-        s_full.append([i, fin_year, entity, app_num, app_url, appdetailid])
+    for i, (fin_year, entity, app_num, app_url, appdetailid, created_date) in enumerate(dated_records, start=1):
+        s_full.append([i, fin_year, entity, app_num, app_url, appdetailid, created_date])
 
-    # 2. Populate 'latest_entities_only'
+    # 5. Populate 'latest_entities_only' — sorted by Date Added, newest first.
     if SIMPLE_SHEET in wb.sheetnames:
         del wb[SIMPLE_SHEET]
     s_simple = wb.create_sheet(SIMPLE_SHEET)
-    s_simple.append(["Sr. No.", "Procuring Entity"])
-    for i, (_, entity, _, _, _) in enumerate(unique_records, start=1):
-        s_simple.append([i, entity])
+    s_simple.append(["Sr. No.", "Procuring Entity", "Date Added"])
 
-    # 3. Preserve/Initialize 'Budget Totals'
+    sorted_by_date = sorted(dated_records, key=lambda r: r[5] or "0000-00-00", reverse=True)
+    for i, (_, entity, _, _, _, created_date) in enumerate(sorted_by_date, start=1):
+        s_simple.append([i, entity, created_date])
+
+    # 6. Preserve/Initialize 'Budget Totals'
     if BUDGET_SHEET not in wb.sheetnames:
         s_budget = wb.create_sheet(BUDGET_SHEET)
         s_budget.append(
             ["Sr. No.", "Procuring Entity", "Total Budget", "Status", "Prequalification done"]
         )
-        for i, (_, entity, _, _, _) in enumerate(unique_records, start=1):
+        for i, (_, entity, _, _, _, _) in enumerate(dated_records, start=1):
             s_budget.append([i, entity, 0.0, "Pending", ""])
             s_budget.cell(row=s_budget.max_row, column=3).number_format = CURRENCY_FORMAT
     else:
@@ -377,13 +575,15 @@ def scrape_to_latest_entities(file_path=EXCEL_FILE):
         s_budget.append(
             ["Sr. No.", "Procuring Entity", "Total Budget", "Status", "Prequalification done"]
         )
-        for i, (_, entity, _, _, _) in enumerate(unique_records, start=1):
+        for i, (_, entity, _, _, _, _) in enumerate(dated_records, start=1):
             key = normalize_key(entity)
             budget, status, prequal = existing_data.get(key, (0.0, "Pending", ""))
             s_budget.append([i, entity, budget, status, prequal])
             s_budget.cell(row=s_budget.max_row, column=3).number_format = CURRENCY_FORMAT
 
-    # 4. Populate 'blacklisted' sheet
+    # 7. Populate 'blacklisted' sheet with the final decided list, and
+    # update the in-process cache so later is_blacklisted() calls in the
+    # same run (deep scrape, enrichment, address tracker) see it too.
     if BLACKLISTED_SHEET in wb.sheetnames:
         del wb[BLACKLISTED_SHEET]
     s_blacklist = wb.create_sheet(BLACKLISTED_SHEET)
@@ -391,26 +591,178 @@ def scrape_to_latest_entities(file_path=EXCEL_FILE):
     for i, entity in enumerate(blacklisted_unique, start=1):
         s_blacklist.append([i, entity])
 
-    # 5. Save
+    _set_blacklist_cache(blacklisted_unique)
+
+    # 8. Save
     safe_save_workbook(wb, file_path)
-    print(f"Success! Written {len(unique_records)} clean records to '{EXCEL_FILE}'.")
+    print(f"Success! Written {len(dated_records)} clean records to '{EXCEL_FILE}'.")
     print(f"Logged {len(blacklisted_unique)} blacklisted entities to '{BLACKLISTED_SHEET}'.")
 
 # ---------------------------------------------------------------------------
 # Entity workbook generation
 # ---------------------------------------------------------------------------
 
+# Full tag -> short display label used in Q1-Q4 cells (RFQ prefix dropped,
+# since the OPEN/AGPO summary column already states "RFQ AGPO" once).
+
+def categorize_and_aggregate_items(items: list) -> dict:
+    """One segment's items -> {"open_agpo": "...", "q1": "...", ...}
+
+    Q1-Q4 show the full tag per item present that quarter (OPEN, RFQ,
+    RFQ WOMEN, RFQ YOUTH, RFQ PWD), joined with "/" when more than one
+    applies — e.g. "OPEN/RFQ WOMEN". "0" if nothing qualifies that quarter.
+
+    OPEN/AGPO summary column only ever shows "OPEN" (any Open Tender item
+    anywhere in the segment's year) and/or "RFQ AGPO" (any GENUINELY
+    AGPO-reserved RFQ item — i.e. RFQ WOMEN/YOUTH/PWD, never plain
+    unreserved RFQ). A segment with only plain "RFQ" tags and no OPEN
+    items summarizes to "0" — unreserved RFQ carries no AGPO significance
+    and should not be flagged as if it did.
+    """
+    quarter_tags = {"q1": set(), "q2": set(), "q3": set(), "q4": set()}
+    all_tags = set()
+
+    for item in items:
+        tag = tag_for_item(item)
+        if tag is None:
+            continue
+        all_tags.add(tag)
+        for q in ("q1", "q2", "q3", "q4"):
+            if item[q] > 0:
+                quarter_tags[q].add(tag)
+
+    QUARTER_ORDER = ["OPEN", "RFQ", "RFQ WOMEN", "RFQ YOUTH", "RFQ PWD"]
+    AGPO_TAGS = {"RFQ WOMEN", "RFQ YOUTH", "RFQ PWD"}
+
+    def quarter_join(tag_set):
+        ordered = [t for t in QUARTER_ORDER if t in tag_set]
+        return "/".join(ordered) if ordered else "0"
+
+    def summary_join(tag_set):
+        parts = []
+        if "OPEN" in tag_set:
+            parts.append("OPEN")
+        if tag_set & AGPO_TAGS:
+            parts.append("RFQ AGPO")
+        return "/".join(parts) if parts else "0"
+
+    return {
+        "open_agpo": summary_join(all_tags),
+        "q1": quarter_join(quarter_tags["q1"]),
+        "q2": quarter_join(quarter_tags["q2"]),
+        "q3": quarter_join(quarter_tags["q3"]),
+        "q4": quarter_join(quarter_tags["q4"]),
+    }
+    
+BIG_TICKET_HEADERS = [
+    "Sr. No.", "UNSPSC/Item Code", "Item Description", "Procurement Type",
+    "Quantity", "Unit of Issue", "Estimated Unit Cost", "Total Cost",
+    "Procurement Method", "Reservation Group", "Tag",
+]
+
+
+def create_big_ticket_sheets(wb, segments: list, by_segment: dict, item_data: dict,
+                              threshold: float = BIG_TICKET_THRESHOLD):
+    """Adds one sheet per qualifying segment to `wb`. A segment qualifies
+    when its overall budget exceeds `threshold` AND its aggregated
+    OPEN/AGPO summary is non-'0' (i.e. contains OPEN and/or RFQ AGPO
+    anywhere in the year). Within a qualifying segment, only individual
+    items that (a) pass the same RFQ/Open Tender qualification rule as
+    the rest of this feature, and (b) have their own Total Cost >=
+    threshold, are listed. Sheet name is the segment's Sr. No. (matching
+    the main sheet's numbering), since segment descriptions are often too
+    long or contain characters Excel won't allow in a sheet name.
+    """
+    font_header = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    fill_header = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    align_wrap = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    align_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for seg in segments:
+        seg_code = seg.get("segment_code", "")
+        seg_total = seg.get("total_cost", 0.0)
+        seg_result = item_data.get(seg_code, {})
+        open_agpo = seg_result.get("open_agpo", "0")
+
+        if seg_total <= threshold or open_agpo == "0":
+            continue
+
+        raw_items = by_segment.get(seg_code, [])
+        qualifying_items = [it for it in raw_items if tag_for_item(it) is not None]
+        big_items = [it for it in qualifying_items if it.get("total_cost", 0.0) >= threshold]
+        if not big_items:
+            continue  # segment qualifies overall, but no single item meets the per-item threshold
+
+        sheet_name = str(seg.get("sr_no", seg_code)).strip()[:31] or seg_code[:31]
+        if sheet_name in wb.sheetnames:
+            del wb[sheet_name]
+        ws = wb.create_sheet(sheet_name)
+
+        ncols = len(BIG_TICKET_HEADERS)
+        ws.merge_cells(f"A1:{get_column_letter(ncols)}1")
+        title = ws["A1"]
+        title.value = f"{seg.get('segment', '')} — Items ≥ KES {threshold:,.0f}"
+        title.font = Font(name="Calibri", size=12, bold=True, color="FFFFFF")
+        title.fill = PatternFill(start_color="002060", end_color="002060", fill_type="solid")
+        title.alignment = align_center
+        ws.row_dimensions[1].height = 28
+
+        ws.append(BIG_TICKET_HEADERS)
+        for c in range(1, ncols + 1):
+            cell = ws.cell(row=2, column=c)
+            cell.font = font_header
+            cell.fill = fill_header
+            cell.alignment = align_center
+
+        row_idx = 3
+        for it in sorted(big_items, key=lambda x: x.get("total_cost", 0.0), reverse=True):
+            tag = tag_for_item(it) or ""
+            ws.append([
+                it.get("sr_no", ""),
+                it.get("item_code", ""),
+                it.get("item_description", ""),
+                it.get("procurement_type", ""),
+                it.get("quantity", ""),
+                it.get("unit_of_issue", ""),
+                it.get("unit_cost", 0.0),
+                it.get("total_cost", 0.0),
+                it.get("procurement_method", ""),
+                it.get("reservation_group", ""),
+                tag,
+            ])
+            ws.cell(row=row_idx, column=7).number_format = CURRENCY_FORMAT
+            ws.cell(row=row_idx, column=8).number_format = CURRENCY_FORMAT
+            for c in range(1, ncols + 1):
+                ws.cell(row=row_idx, column=c).alignment = align_wrap
+            row_idx += 1
+
+        for c in range(1, ncols + 1):
+            col_letter = get_column_letter(c)
+            max_len = max(
+                (len(str(ws.cell(row=r, column=c).value or "")) for r in range(2, row_idx)),
+                default=0,
+            )
+            ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
+
+
+def apply_big_ticket_sheets(filepath: str, segments: list, by_segment: dict, item_data: dict,
+                             threshold: float = BIG_TICKET_THRESHOLD):
+    """Reopens an already-saved entity workbook and adds/refreshes its
+    big-ticket item sheets. Separate from create_entity_template() so
+    the main sheet's save logic doesn't need to know about this feature.
+    """
+    try:
+        wb = load_workbook(filepath)
+    except Exception as e:
+        print(f"[WARNING] Could not open {filepath} for big-ticket sheets: {e}")
+        return
+    create_big_ticket_sheets(wb, segments, by_segment, item_data, threshold=threshold)
+    safe_save_workbook(wb, filepath)
+
+
 def create_entity_template(sr_no: int, entity_name: str, app_no: str,
                             scraped_segments: list, item_data: dict = None) -> float:
-    """Generates formatted entity Excel workbook and returns total budget.
-
-    item_data: optional {segment_code: {"open_agpo": "...", "q1": "...",
-    "q2": "...", "q3": "...", "q4": "..."}}, as produced by
-    categorize_and_aggregate_items(). When a segment's code isn't found in
-    item_data (feature not run yet, or that entity's enrichment failed),
-    falls back to blank strings — same as the original behavior before
-    this feature existed.
-    """
+    """Generates formatted entity Excel workbook and returns total budget."""
     item_data = item_data or {}
 
     filepath = os.path.join(PLANS_DIR, f"{sr_no} {entity_name}.xlsx")
@@ -422,6 +774,7 @@ def create_entity_template(sr_no: int, entity_name: str, app_no: str,
     fill_header = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
     font_bold = Font(name="Calibri", size=11, bold=True)
     align_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    align_wrap = Alignment(horizontal="left", vertical="center", wrap_text=True)
     thin_border = Border(
         left=Side(style="thin", color="D9D9D9"),
         right=Side(style="thin", color="D9D9D9"),
@@ -466,7 +819,9 @@ def create_entity_template(sr_no: int, entity_name: str, app_no: str,
 
         ws.cell(row=current_row, column=3).number_format = "#,##0.00"
         for col in range(1, 9):
-            ws.cell(row=current_row, column=col).border = thin_border
+            cell = ws.cell(row=current_row, column=col)
+            cell.border = thin_border
+            cell.alignment = align_center if col in (1, 3, 4, 5, 6, 7, 8) else align_wrap
         current_row += 1
 
     total_row = current_row
@@ -479,14 +834,26 @@ def create_entity_template(sr_no: int, entity_name: str, app_no: str,
             top=Side(style="thin", color="000000"),
             bottom=Side(style="double", color="000000"),
         )
+        ws.cell(row=total_row, column=col).alignment = align_center
 
-    for col in ws.columns:
-        max_len = max(len(str(cell.value or "")) for cell in col)
-        ws.column_dimensions[get_column_letter(col[0].column)].width = max(max_len + 3, 12)
+    # Width: base it on data rows only (start_row..total_row), never row 1 —
+    # row 1 is the merged banner, and A1 (its top-left cell) holds the FULL
+    # banner text, which would otherwise inflate column A's computed width
+    # since merged cells store their value only in the top-left cell.
+    for col_num in range(1, 9):
+        col_letter = get_column_letter(col_num)
+        max_len = max(
+            (len(str(ws.cell(row=r, column=col_num).value or "")) for r in range(2, total_row + 1)),
+            default=0,
+        )
+        ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
+
+    # Sr. No. is just small integers — force it thin regardless of the
+    # above calculation (header text "Sr. No." would otherwise set it to ~12).
+    ws.column_dimensions["A"].width = 8
 
     safe_save_workbook(wb, filepath)
     return sum(item.get("total_cost", 0.0) for item in scraped_segments)
-
 
 def update_master_budget_totals(entity_name: str, calculated_total: float, status: str = "Partial"):
     """Updates entity budget total and status in 'Budget Totals' sheet.
@@ -766,35 +1133,12 @@ def tag_for_item(item: dict):
     return None
 
 
-def categorize_and_aggregate_items(items: list) -> dict:
-    """One segment's items -> {"open_agpo": "...", "q1": "...", "q2": "...", "q3": "...", "q4": "..."}"""
-    quarter_tags = {"q1": set(), "q2": set(), "q3": set(), "q4": set()}
-    all_tags = set()
-
-    for item in items:
-        tag = tag_for_item(item)
-        if tag is None:
-            continue
-        all_tags.add(tag)
-        for q in ("q1", "q2", "q3", "q4"):
-            if item[q] > 0:
-                quarter_tags[q].add(tag)
-
-    def ordered_join(tag_set):
-        ordered = [t for t in TAG_ORDER if t in tag_set]
-        return ", ".join(ordered) if ordered else "0"
-
-    return {
-        "open_agpo": ordered_join(all_tags),
-        "q1": ordered_join(quarter_tags["q1"]),
-        "q2": ordered_join(quarter_tags["q2"]),
-        "q3": ordered_join(quarter_tags["q3"]),
-        "q4": ordered_join(quarter_tags["q4"]),
-    }
-
-
 def parse_item_details_export(filepath: str) -> list:
-    """Reads a downloaded Item Details export into a list of raw item dicts."""
+    """Reads a downloaded Item Details export into a list of raw item dicts.
+    Keeps both the categorization fields (procurement_method, reservation_group,
+    women/youth/pwd, q1-q4 quantities) and the display fields needed for the
+    big-ticket item sheets (item description, quantity, costs, etc.).
+    """
     wb = openpyxl.load_workbook(filepath, data_only=True)
     ws = wb.active
 
@@ -814,6 +1158,14 @@ def parse_item_details_export(filepath: str) -> list:
         item_code = get(row_vals, "UNSPSC/Item Code")
         items.append({
             "segment_code": derive_segment_code(item_code),
+            "sr_no": get(row_vals, "Sr.No.", ""),
+            "item_code": item_code,
+            "item_description": get(row_vals, "UNSPSC/Item Description", ""),
+            "procurement_type": get(row_vals, "Procurement Type", ""),
+            "quantity": get(row_vals, "Quantity", ""),
+            "unit_of_issue": get(row_vals, "Unit of Issue", ""),
+            "unit_cost": _to_float(get(row_vals, "Estimated Unit Cost", 0)),
+            "total_cost": _to_float(get(row_vals, "Total Cost", 0)),
             "procurement_method": str(get(row_vals, "Procurement Method", "")).strip(),
             "reservation_group": str(get(row_vals, "Preference & Reservation Group", "")).strip(),
             "women": _to_float(get(row_vals, "Women", 0)),
@@ -852,7 +1204,7 @@ def search_and_open_entity(page, app_number: str, entity_name: str) -> str:
     search_input.first.fill(app_number)
     page.wait_for_timeout(300)
 
-    search_button = page.locator("button:has-text('Search')")
+    search_button = page.locator("button[type='submit']:has-text('Search')")
     if search_button.count() == 0:
         raise RuntimeError("Search submit button not found.")
     search_button.first.click()
@@ -997,7 +1349,8 @@ def run_item_details_enrichment(file_path=EXCEL_FILE, overwrite=False, delay_sec
                     }
 
                     tot = create_entity_template(sr_no, entity, app_no, segments, item_data=item_data)
-                    update_master_budget_totals(entity, tot, status="Partial")
+                    apply_big_ticket_sheets(target_filepath, segments, by_segment, item_data)
+                    update_master_budget_totals(entity, tot, status="Done")
                     print(f"  -> {len(segments)} segments, {len(items)} items parsed, total KES {tot:,.2f}")
                     processed += 1
 
@@ -1009,7 +1362,3 @@ def run_item_details_enrichment(file_path=EXCEL_FILE, overwrite=False, delay_sec
             browser.close()
 
     print(f"\nDone. Enriched {processed} entities.")
-
-
-if __name__ == "__main__":
-    reconcile_budget_totals_from_workbooks()
