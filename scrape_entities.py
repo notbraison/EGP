@@ -106,6 +106,12 @@ def pull_blacklist_from_gsheet(sheet_url=None):
             names.add(normalize_key(row[1]))
     return names
 
+def safe_filename(name: str) -> str:
+    """Strips characters Windows/Excel won't allow in a filename, so
+    entities like 'NEPAD / APRM KENYA SECRETARIAT' don't crash file
+    creation (Windows treats '/' as a path separator even mid-filename).
+    """
+    return re.sub(r'[\\/:*?"<>|]', '-', str(name)).strip()
 
 def _auto_detect_blacklist(entity_name: str) -> bool:
     """Heuristic used ONLY to seed the blacklist the first time an entity
@@ -244,7 +250,7 @@ def sync_and_rename_workbooks(master_df: pd.DataFrame):
         entity_name = str(row["Procuring Entity"]).strip()
         norm_key = normalize_key(entity_name)
 
-        new_filename = f"{sr_no} {entity_name}.xlsx"
+        new_filename = f"{sr_no} {safe_filename(entity_name)}.xlsx"
         new_filepath = os.path.join(PLANS_DIR, new_filename)
 
         if norm_key in file_map:
@@ -748,8 +754,9 @@ def create_big_ticket_sheets(wb, segments: list, by_segment: dict, item_data: di
 def apply_big_ticket_sheets(filepath: str, segments: list, by_segment: dict, item_data: dict,
                              threshold: float = BIG_TICKET_THRESHOLD):
     """Reopens an already-saved entity workbook and adds/refreshes its
-    big-ticket item sheets. Separate from create_entity_template() so
-    the main sheet's save logic doesn't need to know about this feature.
+    big-ticket item sheets, then marks the workbook as processed (see
+    entity_needs_big_ticket_sheets) so a legitimately-empty result isn't
+    mistaken for 'not yet checked' on future runs.
     """
     try:
         wb = load_workbook(filepath)
@@ -757,6 +764,7 @@ def apply_big_ticket_sheets(filepath: str, segments: list, by_segment: dict, ite
         print(f"[WARNING] Could not open {filepath} for big-ticket sheets: {e}")
         return
     create_big_ticket_sheets(wb, segments, by_segment, item_data, threshold=threshold)
+    wb.properties.keywords = BIG_TICKET_MARKER
     safe_save_workbook(wb, filepath)
 
 
@@ -765,7 +773,7 @@ def create_entity_template(sr_no: int, entity_name: str, app_no: str,
     """Generates formatted entity Excel workbook and returns total budget."""
     item_data = item_data or {}
 
-    filepath = os.path.join(PLANS_DIR, f"{sr_no} {entity_name}.xlsx")
+    filepath = os.path.join(PLANS_DIR, f"{sr_no} {safe_filename(entity_name)}.xlsx")
     wb = Workbook()
     ws = wb.active
     ws.title = "Procurement Plan"
@@ -1069,7 +1077,7 @@ def run_deep_scrape(file_path=EXCEL_FILE, overwrite=False):
                     continue
                 appdetailid = int(appdetailid)
 
-                target_filepath = os.path.join(PLANS_DIR, f"{sr_no} {entity}.xlsx")
+                target_filepath = os.path.join(PLANS_DIR, f"{sr_no} {safe_filename(entity)}.xlsx")
 
                 if not overwrite and should_skip_entity(entity, budget_df):
                     print(f"[SKIP] Entity completed/has budget: [{sr_no}] {entity}")
@@ -1251,6 +1259,25 @@ def download_and_parse_item_details(page) -> list:
 
     return items
 
+BIG_TICKET_MARKER = "big_ticket_v1_done"
+
+
+def entity_needs_big_ticket_sheets(filepath: str) -> bool:
+    """True if big-ticket sheet generation has never run for this
+    workbook. Uses a document-property marker (not 'does it have extra
+    sheets') because an entity can legitimately qualify for ZERO
+    big-ticket sheets (no segment clears the threshold) — without a
+    marker, that entity would get needlessly re-downloaded on every
+    single pipeline run forever.
+    """
+    if not os.path.exists(filepath):
+        return True
+    try:
+        wb = load_workbook(filepath)
+    except Exception:
+        return True
+    return wb.properties.keywords != BIG_TICKET_MARKER
+
 
 def entity_needs_item_details(filepath: str) -> bool:
     """True if the entity workbook doesn't exist yet, or any of its
@@ -1326,9 +1353,10 @@ def run_item_details_enrichment(file_path=EXCEL_FILE, overwrite=False, delay_sec
                     continue
                 appdetailid = int(appdetailid)
 
-                target_filepath = os.path.join(PLANS_DIR, f"{sr_no} {entity}.xlsx")
+                target_filepath = os.path.join(PLANS_DIR, f"{sr_no} {safe_filename(entity)}.xlsx")
 
-                if not overwrite and not entity_needs_item_details(target_filepath):
+                if not overwrite and not entity_needs_item_details(target_filepath) \
+                        and not entity_needs_big_ticket_sheets(target_filepath):
                     print(f"[SKIP] Already enriched: [{sr_no}] {entity}")
                     continue
 

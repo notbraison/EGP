@@ -16,10 +16,6 @@ EXCEL_FILE = "Procuring_Entities.xlsx"
 
 
 def ensure_no_file_locks() -> bool:
-    """
-    Checks for open Excel lock files (~$*.xlsx).
-    Prompts the user to close Excel and press Enter to re-check, or 'q' to abort.
-    """
     while not check_and_warn_locked_files():
         choice = (
             input("Press [Enter] to re-check after closing Excel, or type 'q' to cancel: ")
@@ -53,11 +49,7 @@ def run_step_1a():
 
 def run_step_1b():
     """Step 2: Deep Scrape individual entity plans, then enrich each with
-    OPEN/AGPO + Q1-Q4 via Item Details. The enrichment is treated as a
-    second pass of the same step rather than a separate pipeline stage,
-    since its only job is to fill in columns Deep Scrape deliberately
-    leaves blank on the first pass.
-    """
+    OPEN/AGPO + Q1-Q4 via Item Details."""
     if not ensure_no_file_locks():
         return False
 
@@ -163,6 +155,38 @@ def run_step_reconcile():
         return False
 
 
+def run_pipeline_skip_addresses():
+    """Executes: Light Scrape -> Deep Scrape+Enrichment -> Budget -> Sync.
+    Skips address enrichment — not currently a priority, and it's the
+    slowest/least essential step (Bing searches vs. everything else being
+    direct portal data).
+    """
+    if not ensure_no_file_locks():
+        return
+
+    start_time = time.time()
+    print("\n==========================================")
+    print(" RUNNING PIPELINE (SKIPPING ADDRESSES)")
+    print("==========================================")
+
+    if not run_step_1a():
+        return
+    if not run_step_1b():
+        return
+    if not run_step_2_budget():
+        return
+
+    print("\n[STEP 4] SKIPPED: Updating 'addresses' (Visits Tracker)...\n")
+
+    if not run_step_4_sync():
+        return
+
+    elapsed = round(time.time() - start_time, 2)
+    print("==========================================")
+    print(f" PIPELINE COMPLETED IN {elapsed}s")
+    print("==========================================\n")
+
+
 def run_full_pipeline():
     """Executes full sequence: Light Scrape -> Deep Scrape+Enrichment -> Budget -> Addresses -> Sync"""
     if not ensure_no_file_locks():
@@ -194,15 +218,16 @@ def print_menu():
     print("==========================================")
     print("        PROCURING ENTITIES WORKFLOW       ")
     print("==========================================")
-    print(" [1] Run FULL Pipeline (all steps below, in order)")
+    print(" [1] Pipeline (SKIP Addresses) — Light+Deep+Enrich -> Budget -> Sync")
+    print(" [2] FULL Pipeline (all steps, including Addresses)")
     print(" ----------------------------------------")
-    print(" [2] Step 1: Light Scrape ('latest_entities' & 'latest_entities_only')")
-    print(" [3] Step 2: Deep Scrape + Enrichment (Entity Plans, OPEN/AGPO, Q1-Q4)")
-    print(" [4] Step 3: Update 'Budget Totals'")
-    print(" [5] Step 4: Update 'addresses' (Search & Fill)")
-    print(" [6] Step 5: Sync to Google Workspace")
+    print(" [3] Step 1: Light Scrape ('latest_entities' & 'latest_entities_only')")
+    print(" [4] Step 2: Deep Scrape + Enrichment (Entity Plans, OPEN/AGPO, Q1-Q4)")
+    print(" [5] Step 3: Update 'Budget Totals'")
+    print(" [6] Step 4: Update 'addresses' (Search & Fill)")
+    print(" [7] Step 5: Sync to Google Workspace")
     print(" ----------------------------------------")
-    print(" [7] Reconcile 'Budget Totals' from entity workbooks (audit tool)")
+    print(" [8] Reconcile 'Budget Totals' from entity workbooks (audit tool)")
     print(" ----------------------------------------")
     print(" [0] Exit")
     print("==========================================")
@@ -211,27 +236,29 @@ def print_menu():
 def main():
     while True:
         print_menu()
-        choice = input("Select an option [0-7]: ").strip()
+        choice = input("Select an option [0-8]: ").strip()
 
         if choice == "1":
-            run_full_pipeline()
+            run_pipeline_skip_addresses()
         elif choice == "2":
-            run_step_1a()
+            run_full_pipeline()
         elif choice == "3":
-            run_step_1b()
+            run_step_1a()
         elif choice == "4":
-            run_step_2_budget()
+            run_step_1b()
         elif choice == "5":
-            run_step_3_addresses()
+            run_step_2_budget()
         elif choice == "6":
-            run_step_4_sync()
+            run_step_3_addresses()
         elif choice == "7":
+            run_step_4_sync()
+        elif choice == "8":
             run_step_reconcile()
         elif choice == "0":
             print("\nExiting workflow runner. Goodbye!")
             sys.exit(0)
         else:
-            print("\n[!] Invalid selection. Please enter a number from 0 to 7.\n")
+            print("\n[!] Invalid selection. Please enter a number from 0 to 8.\n")
 
 
 if __name__ == "__main__":

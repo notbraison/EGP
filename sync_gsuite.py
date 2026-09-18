@@ -6,7 +6,7 @@ import openpyxl
 EXCEL_FILE = "Procuring_Entities.xlsx"
 
 # Web App URLs for both Google Sheets
-BUDGET_SHEET_URL = "https://script.google.com/macros/s/AKfycbwYm_HzK17LPJ3TerMslhBaYWXke887YW5NMc3nc8K-razyviUQPwu-7rmXAZXNg_UG/exec"
+BUDGET_SHEET_URL = "https://script.google.com/macros/s/AKfycbxK0LfVlhReWLp6dwmYscZa-Y_gm8zQRqbeoFq7xXOP3QnXzr_NeOpa2FCnrXxDjVGP/exec"
 VISITS_SHEET_URL = "https://script.google.com/macros/s/AKfycbzRjui20V9982w3Rdr8LiLJJJ3xOVACCfhZR-T50dCzAKbFGlKi810hostkA5tV91CceA/exec"
 
 
